@@ -1,0 +1,30 @@
+# Game material: never committed (everyone supplies their own disc)
+/Sega Ages*/
+/moon/iso_jp/
+*.iso
+*.ISO
+*.bin
+*.elf
+*.irx
+*.p2s
+*.ps2
+mc0/
+mc1/
+# Generated: recompiled code, Ghidra projects/exports, builds, runs, logs
+/moon/build/
+/moon/logs/
+build/
+logs/
+*.log
+ps2_log.txt
+# Generated VU1 program (lifted from the game's microcode)
+external/gitaroo-man-native/external/PS2Recomp/ps2xRuntime/src/lib/vu/generated/
+# Scratch, dumps and third-party manuals
+/scratch/
+/ref/
+# Local state
+.claude/
+__pycache__/
+*.pyc
+.vscode/
+.idea/

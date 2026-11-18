@@ -1,0 +1,65 @@
+# Started from the Marz list (same SCE 3.1 library family): names forced to run as the game's own code even though
+# the runtime has a handler of the same name. Entries the analyzer does not find in this ELF have no effect.
+native = [
+  # Marz has the soft-double helpers (dptofp, fptodp, dpadd...), so these take doubles in a0/v0
+  # while the runtime's handlers of the same names use single floats in f12/f0.
+  "ceil",
+  "cos",
+  "fabs",
+  "floor",
+  "log",
+  "pow",
+  "sqrt",
+  "__ieee754_rem_pio2f",
+  "__kernel_cosf",
+  "__kernel_sinf",
+  "rand",
+  "sprintf",
+  "vsprintf",
+  # Native sprintf/vsprintf call this with a string FILE on the stack, which the runtime's handler rejects.
+  "vfprintf",
+  "sceGifPkCloseGifTag",
+  "sceGifPkAddGsAD",
+  "sceGifPkOpenGifTag",
+  "sceVif1PkInit",
+  "sceVif1PkReset",
+  "sceVif1PkTerminate",
+  "sceVif1PkCnt",
+  "sceVif1PkRef",
+  "sceVif1PkEnd",
+  "sceVif1PkReserve",
+  "sceVif1PkOpenDirectCode",
+  "sceVif1PkCloseDirectCode",
+  "sceVif1PkOpenGifTag",
+  "sceVif1PkCloseGifTag",
+  "sceVif1PkAlign",
+  "sceVif1PkAddGsAD",
+  # No runtime implementation; the original code writes the channel registers, which the memory
+  # system handles for the scratchpad channels Sofdec uses (MWSPR_SaveSprMem).
+  "sceDmaRecv",
+  "sceDmaRecvN",
+  "sceSdRemoteInit",
+  "sceSdRemote",
+  "sceSdTransToIOP",
+  # The game asks for a clear on every buffer swap and patches the clear block in sceGsDBuff itself. The
+  # runtime's handlers leave that block empty and send only the draw environment, so nothing is ever
+  # cleared. The originals fill it in and send all 14 register pairs through sceGsPutDrawEnv.
+  "sceGsSetDefClear",
+  "sceGsSetDefDBuff",
+  "sceGsSetDefDispEnv",
+  "sceGsSetDefDrawEnv",
+  "sceGsSwapDBuff",
+  # The runtime's handler reads (w, h) from a2/a3; the game passes (psm, w, h) in a0-a2. With it,
+  # sceGsSetDefDBuff put the second buffer at FBP 7 (overlapping the first) instead of 0x70.
+  "sceGszbufaddr",
+  # The game's own newlib allocator, as on hardware: it grows its heap against EndOfHeap (the kernel's
+  # value, Syscalls/System.cpp). The runtime's handlers of these names allocate from the runtime's heap.
+  "malloc_r",
+  "free_r",
+  "calloc_r",
+  "malloc_extend_top",
+  "malloc_trim_r",
+  "__malloc_lock",
+  "__malloc_unlock",
+]
+

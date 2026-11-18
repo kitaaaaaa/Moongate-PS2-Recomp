@@ -1,0 +1,4 @@
+# Hand-identified library functions the SCE signature database does not match (name address).
+# libsifcmd software-register accessors: lw/sw on the sreg array at 0x1FB70C0 (sceSifMInitRpc polls register 1).
+sceSifGetSreg 0x002A97C0
+sceSifSetSreg 0x002A97D8

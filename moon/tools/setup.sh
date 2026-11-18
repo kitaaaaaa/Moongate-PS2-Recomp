@@ -36,7 +36,7 @@ source "$TOP/moon/tools/env.sh"
 cd "$MOON"
 
 echo "Extracting the disc..."
-python3 tools/extract_iso.py "$DISC" iso_jp > logs/setup_extract.log
+python3 tools/extract_iso.py "$(cygpath -m "$DISC")" iso_jp > logs/setup_extract.log
 [ -f iso_jp/SLPM_627.67 ] || { echo "SLPM_627.67 is not on this disc: Sega Ages 2500 Vol. 31 Dennou Senki Virtual On (SLPM-62767) is needed" >&2; exit 1; }
 # Memory card folder (the runtime's default: mc0 next to the ELF).
 mkdir -p iso_jp/mc0 src  # src: game sources the runtime build compiles in (none yet)

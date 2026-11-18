@@ -73,6 +73,8 @@ public:
     void DrawPresentation(float x, float y, float w, float h);
 
     static bool Requested();
+    // Queues fn for the host thread, in order with the commands queued so far; does not wait.
+    void EnqueueHostCall(GSNativeHostCall fn);
 
 private:
     enum class CommandType : uint8_t

@@ -3351,6 +3351,24 @@ void GSGpuBackend::Reset()
                   } });
 }
 
+void GSGpuBackend::EnqueueHostCall(GSNativeHostCall fn)
+{
+    Command command;
+    command.type = CommandType::Call;
+    command.extra = NewExtra();
+    command.extra->call = [this, fn = std::move(fn)]() { fn(m_renderer ? m_renderer->NativeSink() : nullptr); };
+    // Like Enqueue, but never waits for the host to drain the queue: callers may hold the GS frontend's state
+    // lock (marker callbacks run inside packet processing), which the host thread can need.
+    std::unique_lock<std::mutex> lock(m_mutex);
+    if (m_stopped)
+        return;
+    if (!OnHostThread())
+        FlushGuestBatchLocked();
+    m_pending.push_back(std::move(command));
+    ++m_queued;
+    PublishLocked();
+}
+
 void GSGpuBackend::Submit(const GSPrimitiveBatch &batch)
 {
     Command command;

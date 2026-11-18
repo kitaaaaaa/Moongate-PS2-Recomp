@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/gs/gs_types.h"
+#include "runtime/gs/gs_native_layer.h"
 
 #include <cstdint>
 #include <string>
@@ -45,4 +46,6 @@ public:
     virtual void UploadImage(const uint8_t *, uint32_t) {}
     // Whether the backend's HLE frame clear may be used (it writes GS memory outside the GS rules).
     virtual bool AllowsHleClear() const { return true; }
+    // Where native pictures go into GS memory (gs_native_layer.h); nullptr when not supported.
+    virtual GSNativeSink *NativeSink() { return nullptr; }
 };

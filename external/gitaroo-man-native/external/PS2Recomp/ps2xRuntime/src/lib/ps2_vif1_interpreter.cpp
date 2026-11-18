@@ -455,6 +455,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
         if (opcode == VIF_NOP)
         {
+            // NOP with NUM 0x7E and a non-zero IMM (the VIF ignores both): a GS-stream marker at this point of
+            // the chain (gs_native_layer.h). A complete PACKED GIF packet writing kGSNativeMarkerReg =
+            // 0x10000 | IMM goes to the GS in order, so native work placed by game code runs where the chain
+            // puts it. No VIF state changes beyond what any NOP does.
+            if (num == 0x7Eu && imm != 0u)
+            {
+                uint64_t pkt[4] = {(1ull << 60) | (1ull << 15) | 1ull, 0xEull, 0x10000ull | imm, 0x7Eull};
+                submitGifPacket(GifPathId::Path2, reinterpret_cast<const uint8_t *>(pkt), sizeof(pkt), true, false);
+            }
             continue;
         }
         else if (opcode == VIF_STCYCL)

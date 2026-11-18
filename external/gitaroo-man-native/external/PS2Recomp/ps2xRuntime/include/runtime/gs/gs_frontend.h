@@ -1,6 +1,7 @@
 #ifndef PS2_GS_FRONTEND_H
 #define PS2_GS_FRONTEND_H
 
+#include "runtime/gs/gs_native_layer.h"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -110,6 +111,11 @@ public:
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
     // The GPU backend when it is the active one (the host loop drives it), else nullptr.
     GSGpuBackend *gpuBackend();
+    // Runs fn on the GS host thread in order with the GS work sent so far (gs_native_layer.h); false when
+    // the active backend has no host thread.
+    bool queueNativeHostCall(GSNativeHostCall fn);
+    // Called for writes of kGSNativeMarkerReg (gs_native_layer.h), on the thread processing the GS packet.
+    void setNativeMarker(GSNativeMarker fn) { m_nativeMarker = std::move(fn); }
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -261,6 +267,7 @@ private:
     bool m_debugHistoryPaused = true;
 
     std::unique_ptr<GSRasterBackend> m_backend;
+    GSNativeMarker m_nativeMarker;
 };
 
 #endif

@@ -53,7 +53,14 @@ namespace
             return;
         if (s_tracedTick == UINT64_MAX)
             s_tracedTick = tick;
-        if (tick != s_tracedTick)
+        // PS2X_TRACE_DRAWS_TICKS=<n> extends the trace to n consecutive ticks (default 1).
+        static const uint64_t s_traceTicks = []()
+        {
+            const char *value = std::getenv("PS2X_TRACE_DRAWS_TICKS");
+            const long n = value ? std::strtol(value, nullptr, 0) : 1L;
+            return static_cast<uint64_t>(n > 0 ? n : 1L);
+        }();
+        if (tick >= s_tracedTick + s_traceTicks)
             return;
         const GSDrawState &st = batch.state;
         const GSContext &c = st.context;
@@ -1428,6 +1435,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    if (regAddr == kGSNativeMarkerReg)
+    {
+        if (m_nativeMarker)
+            m_nativeMarker(value, m_ctx[0].frame.fbp, m_ctx[0].frame.fbw, m_ctx[0].frame.psm);
+        return;
+    }
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
@@ -2020,6 +2033,15 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 GSGpuBackend *GS::gpuBackend()
 {
     return dynamic_cast<GSGpuBackend *>(m_backend.get());
+}
+
+bool GS::queueNativeHostCall(GSNativeHostCall fn)
+{
+    GSGpuBackend *backend = gpuBackend();
+    if (!backend)
+        return false;
+    backend->EnqueueHostCall(std::move(fn));
+    return true;
 }
 
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)

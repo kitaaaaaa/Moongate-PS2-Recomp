@@ -32,7 +32,7 @@ class GSCpuBackend;
 // before the next draw.
 //
 // PS2X_GS_BACKEND=exact selects it. Internal resolution is always 1x (the GS has no other).
-class GSExactRenderer final : public GSHostRenderer
+class GSExactRenderer final : public GSHostRenderer, public GSNativeSink
 {
 public:
     explicit GSExactRenderer(GSCpuBackend &cpu);
@@ -65,6 +65,8 @@ public:
     bool BeginTransfer(const GSTransferCommand &command) override;
     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
     bool AllowsHleClear() const override { return false; }
+    GSNativeSink *NativeSink() override { return this; }
+    bool WriteFrameFromTexture(unsigned glTexture, const GSNativeTarget &target) override;
 
 private:
     static constexpr uint32_t kPageCount = 512u;
@@ -98,7 +100,7 @@ private:
 
     // GL objects.
     unsigned m_memBuf = 0, m_swzBuf = 0, m_primBuf = 0, m_stateBuf = 0, m_clutBuf = 0, m_counterBuf = 0, m_psmBuf = 0;
-    unsigned m_xferProgram = 0, m_imgBuf = 0;
+    unsigned m_xferProgram = 0, m_imgBuf = 0, m_texWriteProgram = 0;
     // The host->local transfer in progress (4.1 / 4.3): destination, pixels done, bytes not yet used.
     GSTransferCommand m_xfer{};
     bool m_xferActive = false;

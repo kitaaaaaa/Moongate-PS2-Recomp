@@ -929,6 +929,25 @@ void main()
 }
 )GLSL";
 
+    // Native pictures (gs_native_layer.h): one invocation per pixel of the target rectangle writes the
+    // texture's texel as a PSMCT32 pixel (all 32 bits).
+    const char *kTexWriteBody = R"GLSL(
+layout(local_size_x = 16, local_size_y = 16) in;
+uniform sampler2D uTex;
+uniform uint uFbp, uFbw, uX, uY, uW, uH;
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= uW || p.y >= uH)
+        return;
+    vec4 c = texelFetch(uTex, ivec2(p), 0);
+    uvec4 b = uvec4(round(clamp(c, 0.0, 1.0) * 255.0));
+    uint word, shift;
+    pixelWord(0u, uFbp * 32u, uFbw, (uX + p.x) & 2047u, (uY + p.y) & 2047u, word, shift);
+    writeBits(word, b.r | (b.g << 8u) | (b.b << 16u) | (b.a << 24u), 0xFFFFFFFFu);
+}
+)GLSL";
+
     const char *kCrtcVertex = R"GLSL(#version 430
 void main()
 {
@@ -1192,6 +1211,23 @@ void GSExactRenderer::EnsureGl()
             }
         }
         glGenBuffers(1, &m_imgBuf);
+    }
+    {
+        const unsigned cs = compile(GL_COMPUTE_SHADER, std::string("#version 430\n") + kCommonGlsl + kTexWriteBody);
+        if (cs)
+        {
+            m_texWriteProgram = glCreateProgram();
+            glAttachShader(m_texWriteProgram, cs);
+            glLinkProgram(m_texWriteProgram);
+            glDeleteShader(cs);
+            GLint ok = 0;
+            glGetProgramiv(m_texWriteProgram, GL_LINK_STATUS, &ok);
+            if (!ok)
+            {
+                glDeleteProgram(m_texWriteProgram);
+                m_texWriteProgram = 0; // native pictures unsupported; the rest works
+            }
+        }
     }
     if (!m_drawProgram || !m_crtcProgram || !m_clutProgram || !m_xferProgram || !m_seqProgram)
     {
@@ -2180,6 +2216,56 @@ bool GSExactRenderer::BeginTransfer(const GSTransferCommand &command)
         else
             m_xferMirror = true;
     }
+    return true;
+}
+
+bool GSExactRenderer::WriteFrameFromTexture(unsigned glTexture, const GSNativeTarget &t)
+{
+    if (!m_glReady || !m_texWriteProgram || t.w <= 0 || t.h <= 0)
+        return false;
+    NoteFlush("native");
+    FlushDraws(); // drawing queued before the picture comes first
+    uint32_t first, count;
+    pageSpan(GS_PSM_CT32, t.fbp * 32u, t.fbw, static_cast<uint32_t>(t.x), static_cast<uint32_t>(t.y), static_cast<uint32_t>(t.w),
+             static_cast<uint32_t>(t.h), first, count);
+    FlushPendingEpoch();
+    ++m_epochCounter;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const uint32_t p = (first + i) % kPageCount;
+        m_pageEpoch[p] = m_epochCounter;
+        m_gpuNewer[p] = true; // written on the GPU only; CPU users pull it
+    }
+    ++m_batchGen;
+    UploadDirtyPages();
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
+                    GL_FRAMEBUFFER_BARRIER_BIT);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_memBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_swzBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_counterBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_psmBuf);
+    glUseProgram(m_texWriteProgram);
+    static GLint u[7] = {-2};
+    if (u[0] == -2)
+    {
+        const char *names[7] = {"uTex", "uFbp", "uFbw", "uX", "uY", "uW", "uH"};
+        for (int i = 0; i < 7; ++i)
+            u[i] = glGetUniformLocation(m_texWriteProgram, names[i]);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, glTexture);
+    glUniform1i(u[0], 0);
+    glUniform1ui(u[1], t.fbp);
+    glUniform1ui(u[2], t.fbw);
+    glUniform1ui(u[3], static_cast<uint32_t>(t.x));
+    glUniform1ui(u[4], static_cast<uint32_t>(t.y));
+    glUniform1ui(u[5], static_cast<uint32_t>(t.w));
+    glUniform1ui(u[6], static_cast<uint32_t>(t.h));
+    glDispatchCompute((static_cast<uint32_t>(t.w) + 15u) / 16u, (static_cast<uint32_t>(t.h) + 15u) / 16u, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    Note("native-picture");
     return true;
 }
 

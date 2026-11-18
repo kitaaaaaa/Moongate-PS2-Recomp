@@ -1409,6 +1409,11 @@ void main()
         runtime->gs().queueNativeHostCall([fr](GSNativeSink *sink) { render(*fr, sink); });
     }
 
+    // Held slow-motion frames (see saveHook/restoreHook below).
+    std::vector<uint32_t> g_heldGeo[2];
+    std::vector<uint32_t> g_frameGeo;   // the geo list the last native frame was built from
+    std::vector<uint32_t> g_restoreGeo; // set by restoreHook for the frame being drawn
+
     // The frame prepared by frameHook for the chainHook call inside the original FUN_002093c0 (EE thread only).
     std::shared_ptr<Frame> g_chainFrame;
 
@@ -1508,8 +1513,15 @@ void main()
                 g_waitNs += nsSince(w0);
             }
             auto fr = std::make_shared<Frame>();
-            fr->geo.resize(kBufferRamWords);
-            std::memcpy(fr->geo.data(), rdram + kBufferRam, kBufferRamWords * 4u);
+            if (!g_restoreGeo.empty())
+                fr->geo = std::move(g_restoreGeo); // a held frame: the list the port also redraws (restoreHook)
+            else
+            {
+                fr->geo.resize(kBufferRamWords);
+                std::memcpy(fr->geo.data(), rdram + kBufferRam, kBufferRamWords * 4u);
+            }
+            g_restoreGeo.clear();
+            g_frameGeo = fr->geo;
             fr->pagesA.assign(rdram + w2 + kW2PagesA, rdram + w2 + kW2PagesA + 0x80000u);
             fr->pagesB.assign(rdram + w2 + kW2PagesB, rdram + w2 + kW2PagesB + 0x80000u);
             fr->luma.assign(rdram + w2 + kW2Luma, rdram + w2 + kW2Luma + 0x8000u);
@@ -1618,6 +1630,36 @@ void main()
         }
         g_frameOriginal(rdram, ctx, runtime);
         g_chainFrame.reset(); // not consumed: the original took another branch
+        g_restoreGeo.clear();
+    }
+
+    // Slow motion (KO replay, VR viewer) holds frames: FUN_001f8018 sets the hold flag 0x5684CC (with 0x564910 set),
+    // the game logic then does not rebuild the geo list, and the port draws a saved converted list instead of parsing:
+    // FUN_001f8060 (after each draw, hold flag clear) saves the GeoBuffer to slot 0x5684C8 of two at 0x75B000 and
+    // advances the slot (0x567128 = next slot; flag 0x5684D0 also saves to the other slot), and FUN_001f8118
+    // (instead of the parser, hold flag set) copies slot 0x567128 back and advances it unless 0x5684D0 is set.
+    // The native path keeps the same two slots of the raw geo list, under the same conditions.
+    constexpr uint32_t kHoldEnable = 0x00564910u, kHoldFlag = 0x005684CCu, kSaveSlot = 0x005684C8u, kSaveBoth = 0x005684D0u,
+                       kRestoreSlot = 0x00567128u;
+    PS2Runtime::RecompiledFunction g_saveOriginal = nullptr, g_restoreOriginal = nullptr;
+
+    void saveHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_001f8060
+    {
+        if (rd32(rdram, kHoldEnable) != 0u && rd32(rdram, kHoldFlag) == 0u)
+        {
+            const uint32_t slot = rd32(rdram, kSaveSlot) & 1u;
+            g_heldGeo[slot] = g_frameGeo;
+            if (rd32(rdram, kSaveBoth) != 0u)
+                g_heldGeo[slot ^ 1u] = g_frameGeo; // the original saves to the advanced slot too
+        }
+        g_saveOriginal(rdram, ctx, runtime);
+    }
+
+    void restoreHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_001f8118
+    {
+        if (rd32(rdram, kHoldEnable) != 0u && rd32(rdram, kHoldFlag) != 0u)
+            g_restoreGeo = g_heldGeo[rd32(rdram, kRestoreSlot) & 1u];
+        g_restoreOriginal(rdram, ctx, runtime);
     }
 
     // PS2X_MOON_TRACE_THREADS=1: logs the guest thread (and its priority-free id) running the load step FUN_001fdf48
@@ -1650,6 +1692,13 @@ void install(PS2Runtime &runtime)
     runtime.replaceFunction(0x002093c0u, &frameHook);
     runtime.replaceFunction(0x002092d8u, &chainHook);
     runtime.replaceFunction(0x00207810u, &skipObject);
+    g_saveOriginal = runtime.lookupFunction(0x001f8060u);
+    g_restoreOriginal = runtime.lookupFunction(0x001f8118u);
+    if (g_saveOriginal && g_restoreOriginal)
+    {
+        runtime.replaceFunction(0x001f8060u, &saveHook);
+        runtime.replaceFunction(0x001f8118u, &restoreHook);
+    }
     if (envOn("PS2X_MOON_TRACE_THREADS"))
     {
         g_loadStepOriginal = runtime.lookupFunction(0x001fdf48u);

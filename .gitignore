@@ -22,6 +22,10 @@ external/gitaroo-man-native/external/PS2Recomp/ps2xRuntime/src/lib/vu/generated/
 # Scratch, dumps and third-party manuals
 /scratch/
 /ref/
+# What setup.bat makes
+/toolchain/
+/moon/bin/
+/Moongate.exe
 # Local state
 .claude/
 __pycache__/

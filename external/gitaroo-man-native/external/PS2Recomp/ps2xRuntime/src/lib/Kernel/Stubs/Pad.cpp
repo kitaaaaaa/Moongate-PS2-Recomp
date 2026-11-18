@@ -3,7 +3,11 @@
 #include "runtime/ee_scheduler.h"
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <mutex>
+#include <vector>
 
 namespace ps2_stubs
 {
@@ -329,6 +333,76 @@ namespace ps2_stubs
                 applyPress(state, press, tick);
         }
 
+        // PS2X_INPUT_RECORD=<file> writes the pad state the game reads, per port, as text lines
+        // "<port> <read> <buttons> <lx> <ly> <rx> <ry> <vblank>" (hex; one line whenever the state changes, read =
+        // that port's pad-read count). PS2X_INPUT_PLAYBACK=<file> replaces the device input with such a recording,
+        // keyed by the same read count: the game reads each port once per frame, so playback follows the game's
+        // frames, not the wall clock.
+        struct RecordedState
+        {
+            uint64_t read = 0;
+            uint16_t buttons = 0xFFFFu;
+            uint8_t lx = kPadAnalogCenter, ly = kPadAnalogCenter, rx = kPadAnalogCenter, ry = kPadAnalogCenter;
+        };
+
+        void recordOrPlayBack(PadInputState &state, PS2Runtime *runtime, int port)
+        {
+            if (port < 0 || port >= static_cast<int>(kPadPortCount))
+                return;
+            static std::mutex s_mutex;
+            static uint64_t s_reads[kPadPortCount] = {};
+            static FILE *s_record = []() -> FILE * {
+                const char *path = std::getenv("PS2X_INPUT_RECORD");
+                return (path && *path) ? std::fopen(path, "w") : nullptr;
+            }();
+            static std::vector<RecordedState> s_playback[kPadPortCount];
+            static size_t s_next[kPadPortCount] = {};
+            static const bool s_play = []() {
+                const char *path = std::getenv("PS2X_INPUT_PLAYBACK");
+                FILE *f = (path && *path) ? std::fopen(path, "r") : nullptr;
+                if (!f)
+                    return false;
+                unsigned p, b, lx, ly, rx, ry;
+                unsigned long long r, vb;
+                while (std::fscanf(f, "%u %llx %x %x %x %x %x %llx", &p, &r, &b, &lx, &ly, &rx, &ry, &vb) == 8)
+                    if (p < kPadPortCount)
+                        s_playback[p].push_back({r, static_cast<uint16_t>(b), static_cast<uint8_t>(lx), static_cast<uint8_t>(ly),
+                                                 static_cast<uint8_t>(rx), static_cast<uint8_t>(ry)});
+                std::fclose(f);
+                return true;
+            }();
+            if (!s_record && !s_play)
+                return;
+            std::lock_guard<std::mutex> lock(s_mutex);
+            const uint64_t read = s_reads[port]++;
+            if (s_play)
+            {
+                const std::vector<RecordedState> &v = s_playback[port];
+                size_t &i = s_next[port];
+                while (i + 1 < v.size() && v[i + 1].read <= read)
+                    ++i;
+                RecordedState cur;
+                if (!v.empty() && v[i].read <= read)
+                    cur = v[i];
+                state.buttons = cur.buttons;
+                state.lx = cur.lx, state.ly = cur.ly, state.rx = cur.rx, state.ry = cur.ry;
+                return;
+            }
+            static RecordedState s_last[kPadPortCount];
+            static bool s_any[kPadPortCount] = {};
+            RecordedState &last = s_last[port];
+            if (!s_any[port] || last.buttons != state.buttons || last.lx != state.lx || last.ly != state.ly || last.rx != state.rx ||
+                last.ry != state.ry)
+            {
+                s_any[port] = true;
+                last = {read, state.buttons, state.lx, state.ly, state.rx, state.ry};
+                std::fprintf(s_record, "%d %llx %x %x %x %x %x %llx\n", port, static_cast<unsigned long long>(read), state.buttons,
+                             state.lx, state.ly, state.rx, state.ry,
+                             static_cast<unsigned long long>(runtime ? runtime->eeScheduler().currentVSyncTick() : 0u));
+                std::fflush(s_record);
+            }
+        }
+
         void resetPadStateLocked()
         {
             for (PadPortState &portState : g_padPorts)
@@ -451,6 +525,7 @@ namespace ps2_stubs
                     applyKeyboardState(state, portState.analogMode);
                 }
                 applyScriptedState(state, runtime, port);
+                recordOrPlayBack(state, runtime, port);
             }
 
             fillPadStatus(outData, state, portState);

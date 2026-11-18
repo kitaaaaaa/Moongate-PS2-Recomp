@@ -18,6 +18,7 @@
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ee_scheduler.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_native_layer.h"
 
@@ -54,7 +55,6 @@ namespace
     constexpr uint32_t kW2PagesA = 0x457C0u;       // pages 0/1: 8x8 tiles of 128x128 PSMT4 (FUN_00208A88)
     constexpr uint32_t kW2PagesB = 0xC57C0u;       // pages 2/3: two 512x1024 PSMT4 side by side (FUN_00208DA0)
     constexpr uint32_t kW2Luma = 0x1457C0u;        // luma rows: 256 x 128 bytes
-    constexpr uint32_t kW2FrameCount = 0x18DD30u;  // FUN_002093c0 increments it per drawn frame
     // Tilemap (System 24 tile chip as the port keeps it, docs/model2-state-map.md section 2)
     constexpr uint32_t kTileBlock = 0x0062FA00u;   // names, line scroll, registers, masks (MAME tile_ram, compacted)
     constexpr uint32_t kTileBlockBytes = 0xA810u;
@@ -810,6 +810,20 @@ void main()
 }
 )GLSL";
 
+    // Copies the persistent polygon layer over the low tiles: only pixels some frame's polygons have written
+    // (alpha != 0; the polygon shader writes alpha 128/255).
+    const char *kPolyCopyFs = R"GLSL(#version 430
+uniform sampler2D uPoly;
+out vec4 oColor;
+void main()
+{
+    vec4 c = texelFetch(uPoly, ivec2(gl_FragCoord.xy), 0);
+    if (c.a == 0.0)
+        discard;
+    oColor = c;
+}
+)GLSL";
+
     // MAME segaic24 draw_common/draw_rect and model2 screen_update's layer order, per output pixel.
     const char *kTileFs = R"GLSL(#version 430
 out vec4 oColor;
@@ -912,6 +926,8 @@ void main()
         std::vector<uint8_t> linSheet;
         bool ready = false, failed = false;
         GLuint prog = 0, vao = 0, vbo = 0, polyBuf = 0, fbo = 0, target = 0;
+        GLuint polyFbo = 0, polyTex = 0, copyProg = 0; // persistent polygon layer (see render)
+        GLint cPoly = -1;
         GLuint atlasA = 0, atlasB = 0, luma = 0, xlat = 0, pal = 0;
         int tw = 0, th = 0;
         GLint uAtlasA = -1, uAtlasB = -1, uLuma = -1, uXlat = -1, uPal = -1, uScale = -1, uGamma = -1;
@@ -1033,6 +1049,30 @@ void main()
             G.sheet = makeTex(GL_R8UI, 1024, 1024, GL_RED_INTEGER, GL_UNSIGNED_BYTE);
             G.tilePal = makeTex(GL_R16UI, 4096, 1, GL_RED_INTEGER, GL_UNSIGNED_SHORT);
             glGenFramebuffers(1, &G.fbo);
+            glGenFramebuffers(1, &G.polyFbo);
+            {
+                GLuint cvs = compileShader(GL_VERTEX_SHADER, kTileVs), cfs = compileShader(GL_FRAGMENT_SHADER, kPolyCopyFs);
+                if (!cvs || !cfs)
+                {
+                    G.failed = true;
+                    return false;
+                }
+                G.copyProg = glCreateProgram();
+                glAttachShader(G.copyProg, cvs);
+                glAttachShader(G.copyProg, cfs);
+                glLinkProgram(G.copyProg);
+                glDeleteShader(cvs);
+                glDeleteShader(cfs);
+                GLint cok = 0;
+                glGetProgramiv(G.copyProg, GL_LINK_STATUS, &cok);
+                if (!cok)
+                {
+                    std::fprintf(stderr, "[moon-native] polygon copy program link failed\n");
+                    G.failed = true;
+                    return false;
+                }
+                G.cPoly = glGetUniformLocation(G.copyProg, "uPoly");
+            }
             G.ready = true;
         }
         if (G.tw != w || G.th != h)
@@ -1042,6 +1082,14 @@ void main()
             G.target = makeTex(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
             glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, G.target, 0);
+            if (G.polyTex)
+                glDeleteTextures(1, &G.polyTex);
+            G.polyTex = makeTex(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
+            glBindFramebuffer(GL_FRAMEBUFFER, G.polyFbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, G.polyTex, 0);
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(0, 0, 0, 0);
+            glClear(GL_COLOR_BUFFER_BIT); // empty until polygons are drawn
             G.tw = w, G.th = h;
         }
         return true;
@@ -1082,6 +1130,7 @@ void main()
     }
 
     std::atomic<uint64_t> g_hostNs{0}, g_eeNs{0}; // time in render() (host) and in frameHook (EE)
+    std::atomic<uint64_t> g_waitNs{0};             // part of g_eeNs spent in ps2WaitForVif1Chain
     inline uint64_t nsSince(std::chrono::steady_clock::time_point t0)
     {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
@@ -1208,16 +1257,14 @@ void main()
             ++pi;
         }
 
-        glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
         glViewport(0, 0, W, H);
         glDisable(GL_BLEND);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
         glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, G.polyFbo);
         glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT);
-        if (fr.haveTiles)
-            tilePass(false, sx, sy);
         if (!verts.empty())
         {
             glUseProgram(G.prog);
@@ -1244,8 +1291,35 @@ void main()
                 glBindTexture(GL_TEXTURE_2D, 0);
             }
         }
+        glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+        // The picture: low tiles, the polygon layer, high tiles (MAME screen_update order).
+        glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (fr.haveTiles)
+            tilePass(false, sx, sy);
+        glUseProgram(G.copyProg);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, G.polyTex);
+        glUniform1i(G.cPoly, 1);
+        glBindVertexArray(G.tileVao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindTexture(GL_TEXTURE_2D, 0);
         if (fr.haveTiles)
             tilePass(true, sx, sy);
+        // Alpha 0x40 on every pixel, as the port's own pictures have: before its composite the port draws sprites
+        // over FBP 224 that use FBP 224 as their Z buffer with alpha test NOTEQUAL 0x40 (TEST 0x3040f), zeroing
+        // every pixel whose alpha is not 0x40.
+        {
+            GLfloat prevClear[4];
+            glGetFloatv(GL_COLOR_CLEAR_VALUE, prevClear);
+            glDisable(GL_SCISSOR_TEST);
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+            glClearColor(0.0f, 0.0f, 0.0f, 64.0f / 255.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glClearColor(prevClear[0], prevClear[1], prevClear[2], prevClear[3]);
+        }
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
         // Restore before handing over (the sink binds what it needs).
         glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
@@ -1281,9 +1355,13 @@ void main()
 
     // FUN_00207538(a0 = mode, a1 = tile block) replacement: the port's tilemap -> GS sprites pass. Its inputs
     // are kept for the next native frame (FUN_002093c0 follows it in the same draw).
-    void tileHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    void tileHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         ctx->pc = GPR_U32(ctx, 31);
+        static const bool s_trace = envOn("PS2X_MOON_NATIVE_TRACE");
+        if (s_trace)
+            std::fprintf(stderr, "[moon-native] tiles a1 0x%x tick %llu\n", GPR_U32(ctx, 5),
+                         static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()));
         if (GPR_U32(ctx, 5) != kTileBlock)
             return; // only the block the docs describe
         auto t = std::make_unique<TileSnap>();
@@ -1295,24 +1373,17 @@ void main()
         g_pendingTiles = std::move(t);
     }
 
-    // The game draws its frames into FBP 0 / 0x70 (512 wide, sceGsSetDefDBuff via the mode table 0x247cac,
-    // docs/model2-state-map.md); FRAME_1 elsewhere means some other target is set, which is never written.
-    bool isDisplayBuffer(uint32_t fbp, uint32_t fbw, uint32_t psm)
-    {
-        const bool ok = (fbp == 0u || fbp == 0x70u) && fbw == 8u && psm == 0u;
-        static std::atomic<uint64_t> s_other{0};
-        if (!ok && (s_other++ % 600u) == 0u)
-            std::fprintf(stderr, "[moon-native] FRAME_1 is fbp %u fbw %u psm %u, not a display buffer: picture not written\n", fbp, fbw,
-                         psm);
-        return ok;
-    }
+    // Where the picture goes: the port draws each frame into its work buffer FBP 224 (FRAME_1 packet 0x550240,
+    // scissor 0..495 x 0..383 from FUN_002488f8), then FUN_00205200 draws the PS2 sprites over it (the SEGA logo
+    // 0x4C1B40 via FUN_0020b620, 0x4C2A90 via FUN_0020c790) and copies it, scaled to 512x448, into the display buffer
+    // (module packet at +0x35C0's index, TEX0 TBP 7168 = FBP 224), then adds the border bars (0x54CC30/0x54CCF0).
+    // The native picture replaces only the port's Model 2 drawing in that buffer; everything after it is the port's.
+    constexpr GSNativeTarget kWorkBuffer{224u, 8u, 0u, 0u, 496u, 384u};
 
-    // The picture is drawn where the port's own Model 2 output ran: FUN_002093c0 only adds DMA CALLs to the
-    // frame's VIF1 chain (FUN_00246860), which runs later. The hook adds a CALL to a marker packet in the same
-    // place; when the GS stream reaches it, the marker callback queues the native work in stream order, with
-    // FRAME_1 as the port's packets left it (gs_native_layer.h).
+    // Marker ids -> frames. The marker sits in the frame's VIF1 chain where the port's Model 2 packets were
+    // (chainHook); when the GS stream reaches it, the callback queues the native draw in stream order.
     std::mutex g_pendingMutex;
-    std::map<uint32_t, std::shared_ptr<Frame>> g_pending; // marker id -> frame; null = repeat the last picture
+    std::map<uint32_t, std::shared_ptr<Frame>> g_pending;
     uint32_t g_nextMarker = 1;
 
     void onMarker(PS2Runtime *runtime, uint64_t value, uint32_t fbp, uint32_t fbw, uint32_t psm)
@@ -1330,174 +1401,239 @@ void main()
         }
         static const bool s_trace = envOn("PS2X_MOON_NATIVE_TRACE");
         if (s_trace)
-            std::fprintf(stderr, "[moon-native] marker %u %s FRAME_1 fbp %u fbw %u psm %u\n", static_cast<uint32_t>(value),
-                         fr ? "draw" : "repeat", fbp, fbw, psm);
-        if (!isDisplayBuffer(fbp, fbw, psm))
+            std::fprintf(stderr, "[moon-native] marker %u reached, FRAME_1 fbp %u fbw %u psm %u\n", static_cast<uint32_t>(value), fbp,
+                         fbw, psm);
+        if (!fr)
             return;
-        const GSNativeTarget target{fbp, fbw, 0, 0, 512, 448};
-        if (fr)
-        {
-            fr->target = target;
-            runtime->gs().queueNativeHostCall([fr](GSNativeSink *sink) { render(*fr, sink); });
-        }
-        else
-            runtime->gs().queueNativeHostCall([target](GSNativeSink *sink) {
-                if (sink && g_gl.ready && g_gl.target)
-                    sink->WriteFrameFromTexture(g_gl.target, target);
-            });
+        fr->target = kWorkBuffer;
+        runtime->gs().queueNativeHostCall([fr](GSNativeSink *sink) { render(*fr, sink); });
     }
 
-    // Writes the marker packet (DMA cnt + VIF DIRECT + GIF A+D write of kGSNativeMarkerReg, then RET) at addr and
-    // CALLs it from the frame's chain.
-    void emitMarker(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, std::shared_ptr<Frame> fr)
+    // The frame prepared by frameHook for the chainHook call inside the original FUN_002093c0 (EE thread only).
+    std::shared_ptr<Frame> g_chainFrame;
+
+    // FUN_002092d8(a0 = the frame's W2 packet, W2 + 0x3000 + index*0x21380) replacement. That packet is the port's
+    // colour-translation pass for its own polygon textures (CLUT upload + GS draws), CALLed by FUN_002093c0 right
+    // after this; the native path has no use for it. Its first tag is rewritten (below) with VIF codes
+    // NOP(NUM 0x7E, IMM id) and NOP, which the runtime turns into a GS-stream marker (ps2_vif1_interpreter.cpp).
+    // So the marker is CALLed by the game's own code, first in the frame's Model 2 work, and no chain node or
+    // memory of our own is needed. (Earlier versions linked their own CALL node to a marker in a separate buffer;
+    // a ring from guestMalloc shifted the game's malloc blocks, and one of them has a field the game never
+    // initialises: the callback at +0x78 that FUN_0022c448 calls when the system file loads, which then pointed
+    // into stale data.)
+    void chainHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t id;
+        ctx->pc = GPR_U32(ctx, 31);
+        const uint32_t pkt = GPR_U32(ctx, 4);
+        const uint32_t w2 = rd32(rdram, kW2Ptr);
+        if (w2 && rd32(rdram, w2 + 0x18DD34u) != 0u) // FUN_002092d8 clears this flag (it picked its tag with it)
+        {
+            const uint32_t zero = 0u;
+            std::memcpy(rdram + w2 + 0x18DD34u, &zero, 4);
+        }
+        uint32_t id = 0u;
+        if (std::shared_ptr<Frame> fr = std::move(g_chainFrame))
         {
             std::lock_guard<std::mutex> lock(g_pendingMutex);
             id = g_nextMarker++;
-            if (g_nextMarker > 0xFFFFu) // ids travel in the 16-bit MARK immediate
+            if (g_nextMarker > 0xFFFFu) // ids travel in the 16-bit NOP immediate
                 g_nextMarker = 1u;
             g_pending[id] = std::move(fr);
             while (g_pending.size() > 8u) // never reached by the stream (chain dropped): forget the oldest
                 g_pending.erase(g_pending.begin());
         }
-        // One DMA tag: ret, with VIF codes NOP(NUM 0x7E, IMM id) and NOP. The runtime turns that NOP into a
-        // GS-stream marker (ps2_vif1_interpreter.cpp). Tried and dropped: a DIRECT packet of our own (the
-        // runtime continues an unfinished DIRECT image transfer with the next DIRECT data) and MARK (it changes
-        // VIF1_MARK/STAT, which the game's own synchronisation uses); both hung the game at the boot memory
-        // card check.
-        const uint32_t pkt[4] = {0x60000000u, 0u, 0x007E0000u | (id & 0xFFFFu), 0u};
-        std::memcpy(rdram + (addr & 0x01FFFFFFu), pkt, sizeof(pkt));
+        // The packet's top level: +0x00 CALL colour pass, +0x10 the tag FUN_002092d8 writes (cnt, or CALL when the
+        // flag is set), +0x20 CALL the objects' subchain, +0x30 ret with FRAME_1 = FBP 224 (alpha masked), ZBUF_1 and
+        // SCISSOR_1 0..495 x 0..383, the state the overlays and FUN_00205200 then draw with. The marker tag is a
+        // NEXT to +0x30, so only the two Model 2 subchains are skipped.
+        const uint32_t words[4] = {0x20000000u, pkt + 0x30u, id ? (0x007E0000u | id) : 0u, 0u};
+        std::memcpy(rdram + (pkt & 0x01FFFFF0u), words, sizeof(words));
         static const bool s_trace = envOn("PS2X_MOON_NATIVE_TRACE");
-        if (s_trace)
-            std::fprintf(stderr, "[moon-native] emit %u at 0x%x tick %llu\n", id, addr,
+        if (s_trace && id)
+            std::fprintf(stderr, "[moon-native] marker %u at 0x%x tick %llu\n", id, pkt,
                          static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()));
-        // FUN_00244340 (what FUN_00246860(0, addr) runs), written out: a 0x20-byte node {CALL addr; NEXT} taken
-        // from the top of the current descriptor (0x1F96840 + index*0x30, index at 0x1F968A0) and linked last.
-        // Calling the recompiled FUN_00246860 from this hook instead hung the game at the boot memory card
-        // check (markers stopped being reached); writing the node directly does not.
-        auto w32 = [&](uint32_t a, uint32_t v) { std::memcpy(rdram + (a & 0x01FFFFFFu), &v, 4); };
-        auto w64 = [&](uint32_t a, uint64_t v) { std::memcpy(rdram + (a & 0x01FFFFFFu), &v, 8); };
-        const uint32_t d = 0x01F96850u + rd32(rdram, 0x01F968A0u) * 0x30u; // +0 top, +4 last node, +0x10 first node
-        const uint32_t top = rd32(rdram, d);
-        const uint32_t node = top - 0x20u;
-        w32(d, node);
-        if (rd32(rdram, d + 0x10u) == 0u)
-            w32(d + 0x10u, node);
-        else
-            w32(rd32(rdram, d + 4u) + 0x14u, node);
-        w32(d + 4u, node);
-        w64(top - 8u, 0u);
-        w64(top - 0x18u, 0u);
-        w64(node, (static_cast<uint64_t>(addr) << 32) | 0x50000000u);
-        w64(top - 0x10u, 0x20000000u);
-        (void)ctx;
     }
 
-    // FUN_002093c0(a0 = render list header 0x712300, a1 = g_geo) replacement.
+    PS2Runtime::RecompiledFunction g_frameOriginal = nullptr;
+
+    // FUN_002093c0(a0 = render list header 0x712300, a1 = g_geo) wrapper: snapshots the Model 2 state for the native
+    // picture, then runs the original, whose Model 2 polygon parts are replaced (chainHook for its colour pass,
+    // skipObject for op1 objects). Everything else in it is the port's own: the double-buffer and frame counters,
+    // the PS2 overlays (FUN_0020bc10, render-list ops 0x1C/0x1D/0x1E), and at the list's END FUN_00205200 (sprites,
+    // copy to the display buffer, border bars). The repeat case (head 0x7FFFC) only re-composites the work buffer.
     void frameHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ctx->pc = GPR_U32(ctx, 31);
         const auto t0 = std::chrono::steady_clock::now();
         if (!g_roms.tried)
             g_roms.load(PS2Runtime::getIoPaths().elfDirectory);
         const uint32_t w2 = rd32(rdram, kW2Ptr);
         const uint32_t list = GPR_U32(ctx, 4), geoState = GPR_U32(ctx, 5);
-        // FUN_002093c0's own conditions.
-        if (!g_roms.ok || !w2 || !list || (list & 0x3fu) || !geoState || (geoState & 0x3fu))
-            return;
+        g_chainFrame.reset();
+        // PS2X_MOON_DUMP_TICK=<vsync>: writes EE RAM once at the first call from that tick on (moon_ram_<tick>.bin in
+        // the working directory); the runtime's own RAM dump does not run with the exact backend.
+        static const long s_dumpTick = [] { const char *v = std::getenv("PS2X_MOON_DUMP_TICK"); return v ? std::strtol(v, nullptr, 0) : -1L; }();
+        if (s_dumpTick >= 0)
         {
-            // W2+0x18DD2C: the port's double-buffer index (0, 1, 0, ...), advanced on every call.
-            uint32_t b = rd32(rdram, w2 + 0x18DD2Cu) + 1u;
-            if (b > 1u)
-                b = 0u;
-            std::memcpy(rdram + w2 + 0x18DD2Cu, &b, 4);
+            static bool s_dumped = false;
+            const uint64_t tick = runtime->memory().gs().vsyncTick.load();
+            if (!s_dumped && tick >= static_cast<uint64_t>(s_dumpTick))
+            {
+                s_dumped = true;
+                char name[64];
+                std::snprintf(name, sizeof(name), "moon_ram_%06llu.bin", static_cast<unsigned long long>(tick));
+                if (FILE *f = std::fopen(name, "wb"))
+                {
+                    std::fwrite(rdram, 1, 32u * 1024u * 1024u, f);
+                    std::fclose(f);
+                }
+                std::fprintf(stderr, "[moon-native] wrote %s\n", name);
+            }
         }
-        ps2WaitForVif1Chain(); // kept from the tested version (the markers alone keep the order)
-        const uint32_t head = rd32(rdram, list) & 0x7fffcu;
-        const bool repeat = head == 0x7fffcu;                          // FUN_00205200 only: re-show the last picture
-        const bool draw = !repeat && head < 0x20000u && rd32(rdram, list + 4u) != 0u; // the render list
-        if (!repeat && !draw)
-            return;
-        // FUN_00205200 (the port's final composite; called directly when repeating, else at the list's END)
-        // toggles this word 0,1,0,...; the draw (FUN_0014dbd8 via FUN_00205300) reads it as a gate.
-        if (const uint32_t module = rd32(rdram, 0x00568518u))
+        // FUN_002093c0's conditions for drawing a render list.
+        const bool valid = w2 && list && !(list & 0x3fu) && geoState && !(geoState & 0x3fu);
+        const uint32_t head = valid ? (rd32(rdram, list) & 0x7fffcu) : 0x7fffcu;
+        static const bool s_traceCalls = envOn("PS2X_MOON_NATIVE_TRACE");
+        if (s_traceCalls)
+            std::fprintf(stderr, "[moon-native] call tick %llu valid %d head 0x%x n %u idx %u mode %u scene %u sub %d vscr %04x %04x %04x %04x\n",
+                         static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()), valid ? 1 : 0, head,
+                         valid ? rd32(rdram, list + 4u) : 0u, w2 ? rd32(rdram, w2 + 0x18DD2Cu) : 0u, rd32(rdram, 0x00513104u),
+                         rd32(rdram, 0x00513108u), static_cast<int32_t>(rd32(rdram, 0x00566F98u)),
+                         rd32(rdram, 0x00638A08u) & 0xFFFFu, rd32(rdram, 0x00638A08u) >> 16, rd32(rdram, 0x00638A0Cu) & 0xFFFFu,
+                         rd32(rdram, 0x00638A0Cu) >> 16);
+        if (g_roms.ok && head != 0x7fffcu && head < 0x20000u && rd32(rdram, list + 4u) != 0u)
         {
-            uint32_t t = rd32(rdram, module + 0x35C0u) + 1u;
-            if (t > 1u)
-                t = 0u;
-            std::memcpy(rdram + ((module + 0x35C0u) & 0x01FFFFFFu), &t, 4);
+            {
+                const auto w0 = std::chrono::steady_clock::now();
+                ps2WaitForVif1Chain(); // kept from the tested version (the markers alone keep the order)
+                g_waitNs += nsSince(w0);
+            }
+            auto fr = std::make_shared<Frame>();
+            fr->geo.resize(kBufferRamWords);
+            std::memcpy(fr->geo.data(), rdram + kBufferRam, kBufferRamWords * 4u);
+            fr->pagesA.assign(rdram + w2 + kW2PagesA, rdram + w2 + kW2PagesA + 0x80000u);
+            fr->pagesB.assign(rdram + w2 + kW2PagesB, rdram + w2 + kW2PagesB + 0x80000u);
+            fr->luma.assign(rdram + w2 + kW2Luma, rdram + w2 + kW2Luma + 0x8000u);
+            fr->pal.resize(1024);
+            std::memcpy(fr->pal.data(), rdram + kGeoState, 2048);
+            fr->xlat.resize(3u * 32u * 128u);
+            for (int ch = 0; ch < 3; ++ch)
+                for (uint32_t row = 0; row < 32u; ++row)
+                    for (uint32_t l = 0; l < 128u; ++l)
+                        fr->xlat[(ch * 32u + row) * 128u + l] = rdram[kColorXlat[ch] + (row * 256u + l) * 2u];
+            if (g_pendingTiles)
+            {
+                fr->tileWords = std::move(g_pendingTiles->tileWords);
+                fr->charSheet = std::move(g_pendingTiles->charSheet);
+                fr->tilePal = std::move(g_pendingTiles->tilePal);
+                fr->haveTiles = true;
+                g_pendingTiles.reset();
+            }
+            fr->directNormalZ = rd32(rdram, 0x005671A0u);
+            // Geometry on the EE thread (it needs the key tables in EE RAM; cheap next to the frame).
+            Builder b{*fr, rdram};
+            b.run();
+            // PS2X_MOON_DUMP_DROP=<vsync>: from that tick on, when a frame has no polygons right after one with over 100, writes EE RAM
+            // (moon_drop_<tick>.bin) and the previous frame's bufferRAM (moon_drop_<tick>_prev.bin), up to 3 times.
+            {
+                static const long s_dropFrom = [] { const char *v = std::getenv("PS2X_MOON_DUMP_DROP"); return v ? std::strtol(v, nullptr, 0) : -1L; }();
+                const bool s_dumpDrop = s_dropFrom >= 0 && runtime->memory().gs().vsyncTick.load() >= static_cast<uint64_t>(s_dropFrom);
+                static size_t s_prevPolys = 0;
+                static std::vector<uint32_t> s_prevGeo;
+                static int s_drops = 0;
+                if (s_dumpDrop)
+                {
+                    if (fr->polys.empty() && s_prevPolys > 100u && s_drops < 3)
+                    {
+                        ++s_drops;
+                        const unsigned long long tick = runtime->memory().gs().vsyncTick.load();
+                        char name[64];
+                        std::snprintf(name, sizeof(name), "moon_drop_%06llu.bin", tick);
+                        if (FILE *f = std::fopen(name, "wb"))
+                        {
+                            std::fwrite(rdram, 1, 32u * 1024u * 1024u, f);
+                            std::fclose(f);
+                        }
+                        std::snprintf(name, sizeof(name), "moon_drop_%06llu_prev.bin", tick);
+                        if (FILE *f = std::fopen(name, "wb"))
+                        {
+                            std::fwrite(s_prevGeo.data(), 4, s_prevGeo.size(), f);
+                            std::fclose(f);
+                        }
+                        std::fprintf(stderr, "[moon-native] polygon drop at tick %llu (previous frame %zu polygons)\n", tick, s_prevPolys);
+                    }
+                    s_prevPolys = fr->polys.size();
+                    s_prevGeo = fr->geo;
+                }
+            }
+            g_polys += fr->polys.size();
+            g_skipped += fr->skippedObjects;
+            static std::atomic<uint64_t> s_unknownFrames{0};
+            if (fr->unknownOps && (s_unknownFrames++ % 600u) == 0u)
+                std::fprintf(stderr, "[moon-native] geo list stopped at unknown op word 0x%08x\n", fr->lastUnknownOp);
+            const uint64_t f = ++g_frames;
+            static const bool s_stats = envOn("PS2X_MOON_NATIVE_STATS");
+            if (s_stats && (f % 600u) == 0u)
+                std::fprintf(stderr, "[moon-native] frames %llu polys/frame %.0f skipped objects %llu ms/frame EE %.2f host %.2f\n",
+                             static_cast<unsigned long long>(f), double(g_polys.load()) / double(f),
+                             static_cast<unsigned long long>(g_skipped.load()), double(g_eeNs.load()) / 1e6 / double(f),
+                             double(g_hostNs.load()) / 1e6 / double(f));
+            g_chainFrame = std::move(fr);
         }
-        // Marker packets: a ring of 16 x 64 bytes from the runtime's guest heap (kernel RAM below 0x100000, which
-        // the game never uses). W2's packet area was tried first; the game hung at the boot memory card check with
-        // markers there never reached (W2 is re-initialised by the game on mode changes).
-        static uint32_t s_ring = 0, s_slot = 0;
-        if (!s_ring)
-            s_ring = runtime->guestMalloc(16u * 64u, 64u);
-        if (!s_ring)
-            return;
-        const uint32_t markerAddr = s_ring + (s_slot++ & 15u) * 64u;
-        if (repeat)
-        {
-            emitMarker(rdram, ctx, runtime, markerAddr, nullptr);
-            return;
-        }
-        {
-            uint32_t n;
-            std::memcpy(&n, rdram + w2 + kW2FrameCount, 4);
-            ++n;
-            std::memcpy(rdram + w2 + kW2FrameCount, &n, 4);
-        }
-        // FUN_0020bc10's PS2 overlay quads (16 entries at 0x4C1CA0, stride 200): not drawn natively yet.
-        uint32_t activeOverlays = 0;
-        for (uint32_t i = 0; i < 16u; ++i)
-            if (rdram[0x4C1CA0u + i * 200u] != 0u && rd32(rdram, 0x4C1CA4u + i * 200u) != 0u)
-                ++activeOverlays;
-        static std::atomic<uint64_t> s_overlayFrames{0};
-        if (activeOverlays && (s_overlayFrames++ % 600u) == 0u)
-            std::fprintf(stderr, "[moon-native] %u PS2 overlay quads active (not drawn natively)\n", activeOverlays);
-        auto fr = std::make_shared<Frame>();
-        fr->geo.resize(kBufferRamWords);
-        std::memcpy(fr->geo.data(), rdram + kBufferRam, kBufferRamWords * 4u);
-        fr->pagesA.assign(rdram + w2 + kW2PagesA, rdram + w2 + kW2PagesA + 0x80000u);
-        fr->pagesB.assign(rdram + w2 + kW2PagesB, rdram + w2 + kW2PagesB + 0x80000u);
-        fr->luma.assign(rdram + w2 + kW2Luma, rdram + w2 + kW2Luma + 0x8000u);
-        fr->pal.resize(1024);
-        std::memcpy(fr->pal.data(), rdram + kGeoState, 2048);
-        fr->xlat.resize(3u * 32u * 128u);
-        for (int ch = 0; ch < 3; ++ch)
-            for (uint32_t row = 0; row < 32u; ++row)
-                for (uint32_t l = 0; l < 128u; ++l)
-                    fr->xlat[(ch * 32u + row) * 128u + l] = rdram[kColorXlat[ch] + (row * 256u + l) * 2u];
-        if (g_pendingTiles)
-        {
-            fr->tileWords = std::move(g_pendingTiles->tileWords);
-            fr->charSheet = std::move(g_pendingTiles->charSheet);
-            fr->tilePal = std::move(g_pendingTiles->tilePal);
-            fr->haveTiles = true;
-            g_pendingTiles.reset();
-        }
-        fr->directNormalZ = rd32(rdram, 0x005671A0u);
-        // Geometry on the EE thread (it needs the key tables in EE RAM; cheap next to the frame).
-        Builder b{*fr, rdram};
-        b.run();
-        g_polys += fr->polys.size();
-        g_skipped += fr->skippedObjects;
-        static std::atomic<uint64_t> s_unknownFrames{0};
-        if (fr->unknownOps && (s_unknownFrames++ % 600u) == 0u)
-            std::fprintf(stderr, "[moon-native] geo list stopped at unknown op word 0x%08x\n", fr->lastUnknownOp);
-        static std::atomic<uint64_t> s_overlayOpFrames{0};
-        if (fr->overlayOps && (s_overlayOpFrames++ % 600u) == 0u)
-            std::fprintf(stderr, "[moon-native] %u PS2 overlay ops (0x1C) in the geo list (not drawn natively)\n", fr->overlayOps);
-        const uint64_t f = ++g_frames;
-        static const bool s_stats = envOn("PS2X_MOON_NATIVE_STATS");
-        if (s_stats && (f % 600u) == 0u)
-            std::fprintf(stderr, "[moon-native] frames %llu polys/frame %.0f skipped objects %llu ms/frame EE %.2f host %.2f\n",
-                         static_cast<unsigned long long>(f), double(g_polys.load()) / double(f),
-                         static_cast<unsigned long long>(g_skipped.load()), double(g_eeNs.load()) / 1e6 / double(f),
-                         double(g_hostNs.load()) / 1e6 / double(f));
         g_eeNs += nsSince(t0);
-        emitMarker(rdram, ctx, runtime, markerAddr, fr);
+        static const bool s_traceThreads = envOn("PS2X_MOON_TRACE_THREADS");
+        if (s_traceThreads && (runtime->memory().gs().vsyncTick.load() % 30u) == 0u)
+            std::fprintf(stderr, "[moon-native] frame thread %d tick %llu\n", runtime->eeScheduler().currentThreadId(),
+                         static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()));
+        // PS2X_MOON_NATIVE_STATS: per 10 s of wall time, the game's frame interval (calls of this hook), the
+        // frames over 17 ms, and the time this hook spent waiting for the VIF1 chain.
+        {
+            static const bool s_stats = envOn("PS2X_MOON_NATIVE_STATS");
+            if (s_stats)
+            {
+                static auto s_last = std::chrono::steady_clock::now(), s_window = s_last;
+                static uint64_t s_frames = 0, s_slow = 0, s_maxNs = 0, s_waitAtWindow = 0;
+                const auto now = std::chrono::steady_clock::now();
+                const uint64_t dt = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - s_last).count());
+                s_last = now;
+                if (dt > 100000000u)
+                    std::fprintf(stderr, "[moon-native] stall %.1f ms ending at %lld ms tick %llu mode %u scene %u sub %d\n", double(dt) / 1e6,
+                                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                            std::chrono::system_clock::now().time_since_epoch())
+                                                            .count()),
+                                 static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()), rd32(rdram, 0x00513104u),
+                                 rd32(rdram, 0x00513108u), static_cast<int32_t>(rd32(rdram, 0x00566F98u)));
+                ++s_frames;
+                s_slow += dt > 17000000u ? 1u : 0u;
+                s_maxNs = std::max(s_maxNs, dt);
+                if (now - s_window >= std::chrono::seconds(10))
+                {
+                    const uint64_t wait = g_waitNs.load();
+                    std::fprintf(stderr, "[moon-native] window: calls %llu over17ms %llu max %.1f ms vif1-wait %.1f ms tick %llu\n",
+                                 static_cast<unsigned long long>(s_frames), static_cast<unsigned long long>(s_slow), double(s_maxNs) / 1e6,
+                                 double(wait - s_waitAtWindow) / 1e6,
+                                 static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()));
+                    s_window = now, s_frames = 0, s_slow = 0, s_maxNs = 0, s_waitAtWindow = wait;
+                }
+            }
+        }
+        g_frameOriginal(rdram, ctx, runtime);
+        g_chainFrame.reset(); // not consumed: the original took another branch
+    }
+
+    // PS2X_MOON_TRACE_THREADS=1: logs the guest thread (and its priority-free id) running the load step FUN_001fdf48
+    // and the frame FUN_002093c0, to see whether loads share the drawing thread.
+    PS2Runtime::RecompiledFunction g_loadStepOriginal = nullptr;
+    void loadStepTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::fprintf(stderr, "[moon-native] load step thread %d tick %llu cmd %u\n", runtime->eeScheduler().currentThreadId(),
+                     static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()), rd32(rdram, GPR_U32(ctx, 4)));
+        g_loadStepOriginal(rdram, ctx, runtime);
+    }
+
+    // FUN_00207810 (render-list op1: one object's packets for VU1/GS) replacement: the native picture has them.
+    void skipObject(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ctx->pc = GPR_U32(ctx, 31);
     }
 }
 
@@ -1505,9 +1641,23 @@ void install(PS2Runtime &runtime)
 {
     PS2Runtime *rt = &runtime;
     runtime.gs().setNativeMarker([rt](uint64_t value, uint32_t fbp, uint32_t fbw, uint32_t psm) { onMarker(rt, value, fbp, fbw, psm); });
+    g_frameOriginal = runtime.lookupFunction(0x002093c0u);
+    if (!g_frameOriginal)
+    {
+        std::fprintf(stderr, "[moon-native] FUN_002093c0 not found; native renderer off\n");
+        return;
+    }
     runtime.replaceFunction(0x002093c0u, &frameHook);
+    runtime.replaceFunction(0x002092d8u, &chainHook);
+    runtime.replaceFunction(0x00207810u, &skipObject);
+    if (envOn("PS2X_MOON_TRACE_THREADS"))
+    {
+        g_loadStepOriginal = runtime.lookupFunction(0x001fdf48u);
+        if (g_loadStepOriginal)
+            runtime.replaceFunction(0x001fdf48u, &loadStepTrace);
+    }
     if (!envOn("PS2X_MOON_NOTILE"))
         runtime.replaceFunction(0x00207538u, &tileHook);
-    std::fprintf(stderr, "[moon-native] native Model 2 polygon renderer on (FUN_002093c0 replaced)\n");
+    std::fprintf(stderr, "[moon-native] native Model 2 polygon renderer on (FUN_002093c0 wrapped)\n");
 }
 }

@@ -13,6 +13,44 @@ namespace ps2_stubs
         constexpr uint64_t kNtScFieldsPerSecondNumerator = 60000u;
         constexpr uint64_t kNtScFieldsPerSecondDenominator = 1001u;
 
+        // sceCdRead drive time (PCSX2's CDVD model): CD media at 24x (24 x 75 sectors/s), no seek for a jump under 8
+        // sectors, a fast seek (30 ms) under 4371 sectors, else a full seek (100 ms). Counted in vblank ticks; reads
+        // queue behind the previous one. Games that poll sceCdSync(1) see the read busy for that long, as on the
+        // console (Virtual-On's pre-match briefing runs while its loads are pending). PS2X_CD_INSTANT=1: reads
+        // complete at once (the previous behaviour).
+        constexpr uint64_t kCdSectorsPerSecond24x = 24u * 75u;
+        uint64_t g_cdReadBusyUntilTick = 0u;
+        uint32_t g_cdReadHeadLbn = 0u;
+
+        bool cdInstant()
+        {
+            static const bool s_instant = []() {
+                const char *v = std::getenv("PS2X_CD_INSTANT");
+                return v && *v && std::strcmp(v, "0") != 0;
+            }();
+            return s_instant;
+        }
+
+        void noteCdReadTiming(PS2Runtime *runtime, uint32_t lbn, uint32_t sectors)
+        {
+            if (!runtime || cdInstant())
+                return;
+            const uint64_t now = runtime->eeScheduler().currentVSyncTick();
+            const uint32_t delta = lbn > g_cdReadHeadLbn ? lbn - g_cdReadHeadLbn : g_cdReadHeadLbn - lbn;
+            const uint64_t seekMs = delta < 8u ? 0u : (delta < 4371u ? 30u : 100u);
+            // ticks = (seek + transfer) seconds * 60000/1001, rounded up
+            const uint64_t num = (seekMs * kCdSectorsPerSecond24x + 1000u * static_cast<uint64_t>(sectors)) * kNtScFieldsPerSecondNumerator;
+            const uint64_t den = 1000u * kCdSectorsPerSecond24x * kNtScFieldsPerSecondDenominator;
+            const uint64_t ticks = (num + den - 1u) / den;
+            g_cdReadBusyUntilTick = std::max(g_cdReadBusyUntilTick, now) + ticks;
+            g_cdReadHeadLbn = lbn + sectors;
+        }
+
+        bool cdReadBusy(PS2Runtime *runtime)
+        {
+            return runtime && !cdInstant() && runtime->eeScheduler().currentVSyncTick() < g_cdReadBusyUntilTick;
+        }
+
         struct CdStreamTimingState
         {
             bool initialized = false;
@@ -323,6 +361,7 @@ namespace ps2_stubs
 
         if (ok)
         {
+            noteCdReadTiming(runtime, selected.lbn, selected.sectors);
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
             return;
@@ -333,7 +372,11 @@ namespace ps2_stubs
 
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0); // 0 = completed/not busy
+        // sceCdSync(1) polls: busy (1) until the last read's drive time has passed (noteCdReadTiming). sceCdSync(0)
+        // waits: it returns at once (the data is already in place), since stalling the game thread here would also
+        // stall the IOP and audio.
+        const uint32_t mode = getRegU32(ctx, 4);
+        setReturnS32(ctx, (mode == 1u && cdReadBusy(runtime)) ? 1 : 0);
     }
 
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

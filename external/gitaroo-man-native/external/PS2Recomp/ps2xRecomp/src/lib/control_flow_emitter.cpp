@@ -178,7 +178,10 @@ namespace ps2recomp
         m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, target);
         if (target <= sourcePc && !isCallLikeEdge())
         {
-            m_ss << fmt::format("{}if (runtime->eeCheckpointDue()) {{\n", indent);
+            // The loop's instructions are already counted per block (function_emitter.cpp, eePendingCycles); the
+            // checkpoint charges that count, not a flat 32 per pass (tight loops were charged several times what
+            // the EE spends on them, and pacing then froze Virtual-On's pre-match loads for ~0.4 s).
+            m_ss << fmt::format("{}if (runtime->eeCheckpointDue(0u)) {{\n", indent);
             m_ss << fmt::format("{}    return;\n", indent);
             m_ss << fmt::format("{}}}\n", indent);
         }

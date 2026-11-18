@@ -1783,7 +1783,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    // The transfer's own instructions are in eePendingCycles (one cycle each); PS2X_EE_FLAT_CHECKPOINT=1 charges the
+    // earlier flat kGuestDispatchCycles instead.
+    static const bool s_flatDispatch = std::getenv("PS2X_EE_FLAT_CHECKPOINT") != nullptr;
+    const uint32_t dispatchCharge = s_flatDispatch ? EeScheduler::kGuestDispatchCycles : eePendingCycles;
+    eePendingCycles = 0;
+    if (m_eeScheduler && m_eeScheduler->checkpointDue(dispatchCharge))
     {
         ++g_eeCheckpointYields;
         return false;
@@ -2647,7 +2652,12 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    const bool due = m_eeScheduler->checkpointDue(cycles);
+    // Charges the instructions generated code counted since the last checkpoint (eePendingCycles) plus `cycles`.
+    // PS2X_EE_FLAT_CHECKPOINT=1 charges the earlier flat 32 cycles per loop pass instead.
+    static const bool s_flat = std::getenv("PS2X_EE_FLAT_CHECKPOINT") != nullptr;
+    const uint32_t charge = s_flat ? 32u : cycles + eePendingCycles;
+    eePendingCycles = 0;
+    const bool due = m_eeScheduler->checkpointDue(charge);
     if (due)
         ++g_eeCheckpointYields;
     return due;

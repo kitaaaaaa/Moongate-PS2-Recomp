@@ -409,6 +409,9 @@ public:
     const EeScheduler &eeScheduler() const;
     void postEeEvent(EeEvent event);
     bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
+    // Instructions executed by generated code since the last checkpoint (one EE cycle each; the recompiler adds
+    // each straight-line run's length). Checkpoints and inter-function transfers charge and clear it.
+    uint32_t eePendingCycles = 0;
     [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
 
     struct EeExitHandlerRegistration

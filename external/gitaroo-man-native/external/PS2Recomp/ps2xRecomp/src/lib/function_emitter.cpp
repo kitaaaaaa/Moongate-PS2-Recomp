@@ -104,6 +104,18 @@ namespace ps2recomp
         ss << "\n";
 
         bool lastInstructionWasControlFlow = false;
+        // EE cycle accounting: one cycle per executed instruction. Each straight-line run adds its length to
+        // runtime->eePendingCycles before it leaves (a branch, or falling into a label); the scheduler charges the
+        // accumulated count at its checkpoints (loop back-edges, inter-function transfers).
+        uint32_t pendingCycles = 0;
+        auto flushCycles = [&]()
+        {
+            if (pendingCycles != 0u)
+            {
+                ss << "    runtime->eePendingCycles += " << pendingCycles << "u;\n";
+                pendingCycles = 0;
+            }
+        };
 
         for (size_t i = 0; i < instructions.size(); ++i)
         {
@@ -112,6 +124,7 @@ namespace ps2recomp
 
             if (internalTargets.contains(inst.address))
             {
+                flushCycles();
                 constantRegisters.clear();
                 ss << "label_" << std::hex << inst.address << std::dec << ":\n";
             }
@@ -147,6 +160,8 @@ namespace ps2recomp
                         delaySlot = &syntheticDelaySlot;
                     }
 
+                    pendingCycles += 2u; // the branch and its delay slot
+                    flushCycles();
                     if (hasDecodedDelaySlot && internalTargets.contains(delaySlot->address))
                     {
                         ss << "label_" << std::hex << delaySlot->address << std::dec << ":\n";
@@ -178,6 +193,7 @@ namespace ps2recomp
                 }
                 else
                 {
+                    ++pendingCycles;
                     if (!gifDmaKickPlan.valid)
                     {
                         gifDmaKickPlan = tryBuildGifDmaKickPlan(instructions, i, constantRegisters, internalTargets);
@@ -226,6 +242,7 @@ namespace ps2recomp
             }
         }
 
+        flushCycles();
         // Fallthrough with no terminating branch: publish the next PC so the EE dispatcher does not re-enter this function.
         if (!instructions.empty() && !lastInstructionWasControlFlow)
         {

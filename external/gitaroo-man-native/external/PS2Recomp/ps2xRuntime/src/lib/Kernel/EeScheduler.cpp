@@ -470,6 +470,9 @@ void ps2SampleGsInterruptLine(PS2Runtime &runtime)
         g_gsInterruptLine = false;
 }
 
+// PS2X_TRACE_SCHED: why checkpointDue returned true (pending flag, GS line, cycle deadline, slice end reached).
+static uint64_t g_schedWhy[4] = {};
+
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
@@ -489,15 +492,20 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         }
     }
 
+    static const bool s_traceSched = std::getenv("PS2X_TRACE_SCHED") != nullptr;
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
     {
+        if (s_traceSched)
+            ++g_schedWhy[0];
         return true;
     }
 
     // A rising GS interrupt line (FINISH/SIGNAL from the GS, or an IMR unmask) is serviced at the next checkpoint.
     if (!g_gsInterruptLine && gsInterruptLine(m_runtime))
     {
+        if (s_traceSched)
+            ++g_schedWhy[1];
         m_checkpointPending.store(true, std::memory_order_release);
         return true;
     }
@@ -505,6 +513,8 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
     {
+        if (s_traceSched)
+            ++g_schedWhy[2];
         m_checkpointPending.store(true, std::memory_order_release);
         return true;
     }
@@ -513,6 +523,8 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     {
         return false;
     }
+    if (s_traceSched)
+        ++g_schedWhy[3];
 
     // PS2X_NO_TIMESLICE=1: like the EE kernel, never preempt for a thread of the same priority
     // (only a higher one); equal-priority threads then switch only when one blocks or rotates.
@@ -1951,6 +1963,50 @@ void EeScheduler::applyPendingPreemption()
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
+    // PS2X_TRACE_SCHED=1: once per 60 vblanks, how often this ran and why (timer interrupts, queued events,
+    // cycle deadlines).
+    static const bool s_traceSched = std::getenv("PS2X_TRACE_SCHED") != nullptr;
+    if (s_traceSched)
+    {
+        static uint64_t s_calls = 0, s_timer = 0, s_events = 0, s_deadline = 0, s_lastTick = 0;
+        ++s_calls;
+        if (m_pendingEeTimerInterrupts != 0u)
+            ++s_timer;
+        {
+            std::lock_guard lock(m_eventMutex);
+            if (!m_events.empty())
+                ++s_events;
+        }
+        const uint64_t next = m_nextDeadlineCycle.load(std::memory_order_acquire);
+        if (next != 0u && m_eeCycle >= next)
+            ++s_deadline;
+        if (m_vsyncTick >= s_lastTick + 60u)
+        {
+            std::fprintf(stderr, "[sched] why pending %llu gsline %llu deadline %llu slice %llu\n",
+                         static_cast<unsigned long long>(g_schedWhy[0]), static_cast<unsigned long long>(g_schedWhy[1]),
+                         static_cast<unsigned long long>(g_schedWhy[2]), static_cast<unsigned long long>(g_schedWhy[3]));
+            g_schedWhy[0] = g_schedWhy[1] = g_schedWhy[2] = g_schedWhy[3] = 0;
+            std::fprintf(stderr, "[sched] vsync %llu calls %llu timer %llu events %llu deadline %llu eeCycle %llu\n",
+                         static_cast<unsigned long long>(m_vsyncTick), static_cast<unsigned long long>(s_calls),
+                         static_cast<unsigned long long>(s_timer), static_cast<unsigned long long>(s_events),
+                         static_cast<unsigned long long>(s_deadline), static_cast<unsigned long long>(m_eeCycle));
+            s_lastTick = m_vsyncTick, s_calls = s_timer = s_events = s_deadline = 0;
+        }
+    }
+    // Fast path: the run loop calls this on every pass, and guest code split into many small functions (Virtual-On's
+    // lzs2 decoder and model converters) passes through it millions of times per second. With nothing to do (no
+    // posted event or scheduled interrupt: both set m_checkpointPending; no EE timer interrupt; no cycle deadline
+    // due; no GS interrupt line change) it only applies a requested preemption.
+    {
+        const uint64_t next = m_nextDeadlineCycle.load(std::memory_order_acquire);
+        if (!m_checkpointPending.load(std::memory_order_acquire) && m_pendingEeTimerInterrupts == 0u &&
+            !(next != 0u && m_eeCycle >= next) && !m_stopRequested.load(std::memory_order_acquire) &&
+            gsInterruptLine(m_runtime) == g_gsInterruptLine)
+        {
+            applyPendingPreemption();
+            return;
+        }
+    }
     processDueDeadlines();
     const bool gsLine = gsInterruptLine(m_runtime);
     if (gsLine && !g_gsInterruptLine)
@@ -1994,7 +2050,6 @@ void EeScheduler::processDueDeadlines()
         std::chrono::steady_clock::time_point pacingDeadline{};
         {
             std::unique_lock lock(m_eventMutex);
-            const auto now = std::chrono::steady_clock::now();
             for (const ScheduledEvent &item : m_deadlines)
             {
                 if (item.deadlineCycle <= m_eeCycle &&
@@ -2011,6 +2066,8 @@ void EeScheduler::processDueDeadlines()
                 return;
             }
 
+            // The host clock is read only once a deadline is due by cycles (this runs at most checkpoints).
+            const auto now = std::chrono::steady_clock::now();
             if (!g_turboMode && now < pacingDeadline)
             {
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()

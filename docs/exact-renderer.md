@@ -175,7 +175,8 @@ Everything the window shows is drawn at the window's resolution; GS memory stays
   display buffer). Primitives that only write Z are part of a frame pass only when that pass keeps a depth copy
   (prim word 29, culled otherwise): the port clears Z before its depth-tested small text.
 - Precision: the high-resolution passes run the body with `REAL` = float (double in the 1x passes; `LF()`
-  literals), depth values stay double; triangle edges are evaluated from their lower endpoint so shared edges get
+  literals), depth is exact when the vertices share one Z (all 2D) and float otherwise (double precision made the
+  menus fill-bound: ~50 fps at 1920 x 1080 in the system menu, 60 after); triangle edges are evaluated from their lower endpoint so shared edges get
   exactly opposite values. The 1x path is unchanged (CPU check after the change: 1,985,402 prims, 0 bad words).
 - Writes the passes do not repeat (transfers, CPU work, other layouts over those pages) mark the image stale (`HiMarkStale`, by the primitive's own box); it is
   copied from GS memory (`kHiResyncBody`) only when next used (drawn into, read as texture, shown). The native
@@ -187,6 +188,8 @@ Everything the window shows is drawn at the window's resolution; GS memory stays
 - Switches: `PS2X_GS_HIRES=0` (renderer) / `PS2X_MOON_HIRES=0` (native picture at 1x): the previous 1x path.
   `PS2X_GS_HIRES_TRACE=<n>` logs the first n primitives with a shadow role or stale write, `PS2X_GS_HIRES_TIMING=1`
   GPU time of the passes (waits for the GPU), counters `hires-*` in `PS2X_GS_GPU_STATS`.
+- Cost per flush kept small: the depth copy only when a batch writes and tests another Z buffer (the passes run before
+  the batch's 1x draw, so GS memory holds the pre-batch Z), one barrier after all passes, cached uniforms.
 - Measured (scripted 270 s run: menus, stage intro, match, YOU LOSE, continue, game over, attract; 1920 x 1080 and
   1600 x 900 WIDE, RTX 2080): 600 presents per 10 s after boot; 81 presents dropped, all during boot (1x path: 61-72).
   No copies from GS memory after boot. The first run after a shader change drops more while the driver compiles.

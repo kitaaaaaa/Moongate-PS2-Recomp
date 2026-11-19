@@ -95,6 +95,7 @@ private:
         bool batchUse = false;                   // the batch draws into it or reads it as a texture
         // The batch's frame-role primitives use a Z buffer of their own (not this buffer): its high-resolution copy.
         bool batchZImg = false;
+        bool batchZWrite = false; // a frame-role primitive writes that other Z buffer (else GS memory has its values)
         bool batchColor = false; // a frame-role primitive that writes colour (else the pass only matters with batchZImg)
         int batchBox[4]{};       // GS-pixel box (x0, y0, x1, y1 inclusive) of the batch's frame-role primitives
         uint32_t zbp = 0, zpsm = 0, zfbw = 0;
@@ -104,6 +105,7 @@ private:
     bool m_hiOn = false;
     unsigned m_hiProgram = 0, m_hiResyncProgram = 0, m_hiFbo = 0, m_hiBlitFbo[2] = {0, 0}, m_hiZTex = 0;
     int m_hiZW = 0, m_hiZH = 0;
+    double m_statHiArea = 0.0; // shadow-pixel area of the colour-writing frame-role primitives (stats)
     int m_outW = 0, m_outH = 0;              // window rectangle of the picture (DrawPresentation)
     uint32_t m_hiCanvasW = 0, m_hiCanvasH = 0; // PS2 canvas size of the last present
     void HiUpdateSizes();

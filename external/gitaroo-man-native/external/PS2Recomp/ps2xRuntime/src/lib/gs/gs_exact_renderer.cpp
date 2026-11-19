@@ -150,7 +150,7 @@ layout(pixel_interlock_ordered) in;
 
     const char *kDrawFragmentBody = R"GLSL(
 // REAL: double in the GS-exact passes; float in the high-resolution passes (#define HIRES), where exactness to the
-// GS's 1x arithmetic does not apply and double precision is slow on most GPUs. Depth values stay double (exact).
+// GS's 1x arithmetic does not apply and double precision is slow on most GPUs. Depth: exact for equal vertex Z, float otherwise.
 #ifdef HIRES
 #define REAL float
 #define LF(x) x
@@ -540,6 +540,35 @@ bool gsShade(int prim, ivec2 pixIn)
         rgbaF = vRGBA(last); // flat: the colour set before the drawing kick (3.2.8)
     uvec4 cf = uvec4(rgbaF & 0xFFu, (rgbaF >> 8) & 0xFFu, (rgbaF >> 16) & 0xFFu, rgbaF >> 24);
 
+#ifdef HIRES
+    // Depth in the high-resolution passes without double precision (slow on most GPUs): exact when the vertices
+    // share one Z (all 2D), float interpolation otherwise.
+    uint fogF;
+    if (type == 6u)
+    {
+        z = vZ(1u);
+        fogF = vFog(1u);
+    }
+    else if (type == 0u)
+    {
+        z = vZ(0u);
+        fogF = vFog(0u);
+    }
+    else if (type == 1u || type == 2u)
+    {
+        uint z0 = vZ(0u), z1 = vZ(1u);
+        z = z0 == z1 ? z0 : uint(clamp(floor(float(z0) + (float(z1) - float(z0)) * (ln / ld)), 0.0, 4294967040.0));
+        fogF = uint(clamp(lerpFloor(REAL(vFog(0u)), REAL(vFog(1u)), ln, ld), LF(0.0), LF(255.0)));
+    }
+    else
+    {
+        uint z0 = vZ(0u), z1 = vZ(1u), z2 = vZ(2u);
+        z = (z0 == z1 && z1 == z2) ? z0
+                                   : uint(clamp(floor(w0 * float(z0) + w1 * float(z1) + w2 * float(z2) + 1.0e-6), 0.0, 4294967040.0));
+        REAL f = w0 * REAL(vFog(0u)) + w1 * REAL(vFog(1u)) + w2 * REAL(vFog(2u));
+        fogF = uint(clamp(floor(f + LF(1.0e-6)), LF(0.0), LF(255.0)));
+    }
+#else
     double zd;
     uint fogF;
     if (type == 6u)
@@ -554,11 +583,7 @@ bool gsShade(int prim, ivec2 pixIn)
     }
     else if (type == 1u || type == 2u)
     {
-#ifdef HIRES
-        zd = double(vZ(0u)) + floor((double(vZ(1u)) - double(vZ(0u))) * double(ln) / double(ld));
-#else
         zd = lerpFloor(double(vZ(0u)), double(vZ(1u)), ln, ld);
-#endif
         fogF = uint(clamp(lerpFloor(REAL(vFog(0u)), REAL(vFog(1u)), ln, ld), LF(0.0), LF(255.0)));
     }
     else
@@ -569,6 +594,7 @@ bool gsShade(int prim, ivec2 pixIn)
     }
     zd = clamp(floor(zd + LF(1.0e-6)), LF(0.0), LF(4294967295.0));
     z = uint(zd);
+#endif
 
     // ---- 3.4 texture mapping ----
     cv = cf;
@@ -3331,7 +3357,7 @@ void GSExactRenderer::HiDrawPasses()
         any |= t.batchFrame || t.batchZ;
     if (!any || !m_hiProgram)
         return;
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    // (FlushDraws put an SSBO barrier before this; images are covered by the barrier at the end of the last passes.)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_memBuf);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_swzBuf);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_primBuf);
@@ -3345,35 +3371,49 @@ void GSExactRenderer::HiDrawPasses()
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
     glUseProgram(m_hiProgram);
-    // Uniform locations, looked up once per program (this runs on most flushes).
-    static unsigned s_prog = 0;
-    static std::map<std::string, GLint> s_loc;
-    if (s_prog != m_hiProgram)
+    // Uniform locations looked up once per program, and the per-buffer values sent only when they change (this
+    // runs on most flushes: ~6000 per second in the menus).
+    struct Loc
     {
-        s_prog = m_hiProgram;
-        s_loc.clear();
-    }
-    auto U = [&](const char *n) {
-        auto it = s_loc.find(n);
-        if (it == s_loc.end())
-            it = s_loc.emplace(n, glGetUniformLocation(m_hiProgram, n)).first;
-        return it->second;
+        unsigned prog = 0;
+        GLint debug, zMode, target, role, scale, size, tbp[kHiTargets], valid[kHiTargets], tscale[kHiTargets], tex[kHiTargets];
+        uint32_t lastTbp[kHiTargets], lastValid[kHiTargets];
+        float lastSx[kHiTargets], lastSy[kHiTargets];
     };
-    glUniform1i(U("uDebug"), 0);
-    const char *texNames[kHiTargets] = {"uTgtTex0", "uTgtTex1", "uTgtTex2"};
+    static Loc L;
+    if (L.prog != m_hiProgram)
+    {
+        L.prog = m_hiProgram;
+        auto G = [&](const std::string &n) { return glGetUniformLocation(m_hiProgram, n.c_str()); };
+        L.debug = G("uDebug"), L.zMode = G("uHiZMode"), L.target = G("uHiTarget"), L.role = G("uHiRole");
+        L.scale = G("uHiScale"), L.size = G("uHiSize");
+        for (int i = 0; i < kHiTargets; ++i)
+        {
+            const std::string idx = "[" + std::to_string(i) + "]";
+            L.tbp[i] = G("uTgtTbp" + idx), L.valid[i] = G("uTgtValid" + idx), L.tscale[i] = G("uTgtScale" + idx);
+            L.tex[i] = G("uTgtTex" + std::to_string(i));
+            glUniform1i(L.tex[i], 4 + i);
+            L.lastTbp[i] = L.lastValid[i] = ~0u;
+            L.lastSx[i] = L.lastSy[i] = -1.0f;
+        }
+        glUniform1i(L.debug, 0);
+    }
     for (int i = 0; i < kHiTargets; ++i)
     {
         const HiTarget &t = m_hi[i];
-        const std::string idx = "[" + std::to_string(i) + "]";
-        glUniform1ui(U(("uTgtTbp" + idx).c_str()), t.fbp * 32u);
-        glUniform1ui(U(("uTgtValid" + idx).c_str()), (t.valid && t.tex) ? 1u : 0u);
-        glUniform2f(U(("uTgtScale" + idx).c_str()), t.sx, t.sy);
+        const uint32_t tbp = t.fbp * 32u, valid = (t.valid && t.tex) ? 1u : 0u;
+        if (tbp != L.lastTbp[i])
+            glUniform1ui(L.tbp[i], tbp), L.lastTbp[i] = tbp;
+        if (valid != L.lastValid[i])
+            glUniform1ui(L.valid[i], valid), L.lastValid[i] = valid;
+        if (t.sx != L.lastSx[i] || t.sy != L.lastSy[i])
+            glUniform2f(L.tscale[i], t.sx, t.sy), L.lastSx[i] = t.sx, L.lastSy[i] = t.sy;
         glActiveTexture(GL_TEXTURE4 + i);
         glBindTexture(GL_TEXTURE_2D, t.tex);
-        glUniform1i(U(texNames[i]), 4 + i);
     }
     glBindVertexArray(m_vao);
     const GLsizei verts = static_cast<GLsizei>(m_prims.size() / kPrimWords * 6u);
+    bool drew = false;
     for (int i = 0; i < kHiTargets; ++i)
     {
         HiTarget &t = m_hi[i];
@@ -3381,9 +3421,11 @@ void GSExactRenderer::HiDrawPasses()
         {
             if (!(role == 1 ? t.batchFrame : t.batchZ) || !t.valid || !t.tex)
                 continue;
-            if (role == 1 && !t.batchColor && !t.batchZImg)
+            if (role == 1 && !t.batchColor && !(t.batchZImg && t.batchZWrite))
                 continue; // only Z writes, and nothing in the batch tests them
-            const bool zImg = role == 1 && t.batchZImg && m_hiZTex && m_hiZW >= t.w && m_hiZH >= t.h;
+            // The passes run before the batch's 1x draw, so GS memory holds the Z buffer as it was before the batch:
+            // a copy is needed only when the batch also writes it.
+            const bool zImg = role == 1 && t.batchZImg && t.batchZWrite && m_hiZTex && m_hiZW >= t.w && m_hiZH >= t.h;
             if (zImg)
             {
                 // The Z buffer before this batch, at the shadow's resolution (the resync program, Z layout).
@@ -3405,12 +3447,12 @@ void GSExactRenderer::HiDrawPasses()
                 glBindImageTexture(2, m_hiZTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
                 Note("hires-zimage");
             }
-            glUniform1i(U("uHiZMode"), zImg ? 1 : 0);
+            glUniform1i(L.zMode, zImg ? 1 : 0);
             glBindImageTexture(1, t.tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
-            glUniform1i(U("uHiTarget"), i);
-            glUniform1i(U("uHiRole"), role);
-            glUniform2f(U("uHiScale"), t.sx, t.sy);
-            glUniform2i(U("uHiSize"), t.w, t.h);
+            glUniform1i(L.target, i);
+            glUniform1i(L.role, role);
+            glUniform2f(L.scale, t.sx, t.sy);
+            glUniform2i(L.size, t.w, t.h);
             glViewport(0, 0, t.w, t.h);
             // PS2X_GS_HIRES_TIMING=1: GPU time of the shadow passes (each query waits for the GPU: measuring only).
             static const bool s_hiTiming = std::getenv("PS2X_GS_HIRES_TIMING") != nullptr;
@@ -3424,6 +3466,7 @@ void GSExactRenderer::HiDrawPasses()
                 glBeginQuery(GL_TIME_ELAPSED, s_q);
             }
             glDrawArrays(GL_TRIANGLES, 0, verts);
+            drew = true;
             if (s_hiTiming)
             {
                 glEndQuery(GL_TIME_ELAPSED);
@@ -3434,11 +3477,14 @@ void GSExactRenderer::HiDrawPasses()
                     std::fprintf(stderr, "[hires] timing: frame passes %llu %.1f ms total, z passes %llu %.1f ms total\n",
                                  static_cast<unsigned long long>(s_n[0]), s_ns[0] * 1e-6, static_cast<unsigned long long>(s_n[1]), s_ns[1] * 1e-6);
             }
-            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+            // No barrier between passes: within one batch no pass reads what another writes (batch rules), and a
+            // depth copy is written by compute (its own barrier above). One barrier after all passes.
             Note(role == 1 ? "hires-pass-frame" : "hires-pass-z");
         }
-        t.batchFrame = t.batchZ = t.batchZImg = t.batchColor = false;
+        t.batchFrame = t.batchZ = t.batchZImg = t.batchColor = t.batchZWrite = false;
     }
+    if (drew)
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
     glBindImageTexture(1, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
     glBindImageTexture(2, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
     for (int i = 0; i < kHiTargets; ++i)
@@ -3859,6 +3905,8 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
             HiTarget &t = m_hi[i];
             // Only a depth test needs the Z buffer's values (Z writes alone go to the copy when a later primitive
             // of the batch tests them: its pass loads the copy, and every primitive of that pass writes into it).
+            if (((hiFrameMask >> i) & 1u) && !c.zbuf.zmask && c.zbuf.zbp != c.frame.fbp)
+                t.batchZWrite = true;
             if (((hiFrameMask >> i) & 1u) && ztst >= 2u && c.zbuf.zbp != c.frame.fbp)
             {
                 t.batchZImg = true;
@@ -3957,6 +4005,8 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
                     t.batchBox[2] = std::max(t.batchBox[2], hiBox[2]), t.batchBox[3] = std::max(t.batchBox[3], hiBox[3]);
                 t.batchFrame = true;
                 t.batchColor |= !hiZOnly;
+                if (!hiZOnly && hiBox[2] >= hiBox[0])
+                    m_statHiArea += static_cast<double>(hiBox[2] - hiBox[0] + 1) * (hiBox[3] - hiBox[1] + 1) * t.sx * t.sy;
             }
             t.batchZ |= ((hiZMask >> i) & 1u) != 0u;
             if ((hiStaleFrame >> i) & 1u)
@@ -4733,6 +4783,7 @@ std::string GSExactRenderer::StatsSummary() const
     std::ostringstream out;
     static const auto s_start = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count();
+    out << "hires Mpx " << m_statHiArea * 1e-6 << " ";
     out << "game frames " << m_statSwaps << " (" << (secs > 0.0 ? m_statSwaps / secs : 0.0) << "/s avg) ";
     out << "stream copies " << m_statStreamCopies << " snapshot copies " << m_statSnapCopies << " clut readbacks taken "
         << m_statClutRbTaken << " ";

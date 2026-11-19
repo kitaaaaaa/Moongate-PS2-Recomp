@@ -3,6 +3,7 @@
 // Each override replaces one guest function by address. Addresses: docs/model2-state-map.md.
 
 #include "game_overrides.h"
+#include "moon_display.h"
 #include "moon_native.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -29,6 +30,9 @@ namespace
 
     void applyMoonOverrides(PS2Runtime &runtime)
     {
+        // PC resolution entry in the game's DISPLAY SETTING menu (moon_display.cpp); PS2X_MOON_DISPLAY_MENU=0 turns it off.
+        if (const char *v = std::getenv("PS2X_MOON_DISPLAY_MENU"); !(v && std::strcmp(v, "0") == 0))
+            moon_display::install(runtime);
         // Measurement aids: PS2X_MOON_NO3D=1 skips FUN_00207810 (the render-list op1 handler that adds
         // each object's VIF1 chain to the frame, so no Model 2 polygons reach VU1/GS);
         // PS2X_MOON_NOTILE=1 skips FUN_00207538 (tilemap layers -> GS sprites).

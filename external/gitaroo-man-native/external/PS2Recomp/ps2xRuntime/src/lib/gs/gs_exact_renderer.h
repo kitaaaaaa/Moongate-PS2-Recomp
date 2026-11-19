@@ -67,8 +67,51 @@ public:
     bool AllowsHleClear() const override { return false; }
     GSNativeSink *NativeSink() override { return this; }
     bool WriteFrameFromTexture(unsigned glTexture, const GSNativeTarget &target) override;
+    bool ReadFrameToTexture(unsigned glTexture, const GSNativeTarget &target) override;
+    void SetPresentHook(std::function<void(GSNativeSink *sink, const GSNativePresent &present)> hook) override { m_presentHook = std::move(hook); }
+    bool HiResSize(uint32_t fbp, int &w, int &h) override;
+    bool WriteHiResFromTexture(unsigned glTexture, int texW, int texH, const GSNativeTarget &target) override;
 
 private:
+    // ---- high-resolution shadow buffers (PS2X_GS_HIRES, on by default) ----
+    // The work buffer (FBP 224, 496 x 384) and the two display buffers (FBP 0 / 0x70, 512 x 448, all FBW 8, 32-bit)
+    // each have a shadow image at the window's resolution. Every primitive the batch draws into one of them (or
+    // whose Z buffer is one of them) is drawn a second time into its shadow image by the same pipeline, sampled at
+    // the shadow pixel's centre; textures that are a shadowed buffer are read from its shadow image; the PCRTC
+    // picture is made from the shadow images. GS memory stays the GS's own (1x); writes the shadow passes do not
+    // repeat (transfers, CPU writes, other formats over those pages) copy GS memory into the shadow (resync).
+    struct HiTarget
+    {
+        uint32_t fbp = 0, gsW = 0, gsH = 0;
+        uint32_t firstPage = 0, pageCount = 0;
+        float sx = 1.0f, sy = 1.0f; // shadow pixels per GS pixel
+        int w = 0, h = 0;
+        unsigned tex = 0;
+        bool valid = false;
+        // GS-pixel rectangles to copy from GS memory: before the next use (stale) or after this batch (staleAfter).
+        bool stale = false, staleAfter = false;
+        int staleRect[4]{}, staleAfterRect[4]{};
+        bool batchFrame = false, batchZ = false; // the batch draws into it (role 1 / 2)
+        bool batchUse = false;                   // the batch draws into it or reads it as a texture
+        // The batch's frame-role primitives use a Z buffer of their own (not this buffer): its high-resolution copy.
+        bool batchZImg = false;
+        bool batchColor = false; // a frame-role primitive that writes colour (else the pass only matters with batchZImg)
+        int batchBox[4]{};       // GS-pixel box (x0, y0, x1, y1 inclusive) of the batch's frame-role primitives
+        uint32_t zbp = 0, zpsm = 0, zfbw = 0;
+    };
+    static constexpr int kHiTargets = 3;
+    std::array<HiTarget, kHiTargets> m_hi{};
+    bool m_hiOn = false;
+    unsigned m_hiProgram = 0, m_hiResyncProgram = 0, m_hiFbo = 0, m_hiBlitFbo[2] = {0, 0}, m_hiZTex = 0;
+    int m_hiZW = 0, m_hiZH = 0;
+    int m_outW = 0, m_outH = 0;              // window rectangle of the picture (DrawPresentation)
+    uint32_t m_hiCanvasW = 0, m_hiCanvasH = 0; // PS2 canvas size of the last present
+    void HiUpdateSizes();
+    void HiMarkStale(int i, uint32_t first, uint32_t count, bool after);
+    void HiResync(int i, const int rect[4]);
+    void HiResyncPending(bool after, bool useOnly = false);
+    void HiDrawPasses();
+    void HiTouchPages(uint32_t first, uint32_t count); // GS memory written outside the shadow passes
     static constexpr uint32_t kPageCount = 512u;
     static constexpr uint32_t kPageBytes = 8192u;
     static constexpr uint32_t kPrimWords = 32u;
@@ -101,6 +144,8 @@ private:
     // GL objects.
     unsigned m_memBuf = 0, m_swzBuf = 0, m_primBuf = 0, m_stateBuf = 0, m_clutBuf = 0, m_counterBuf = 0, m_psmBuf = 0;
     unsigned m_xferProgram = 0, m_imgBuf = 0, m_texWriteProgram = 0;
+    unsigned m_texReadProgram = 0;
+    std::function<void(GSNativeSink *sink, const GSNativePresent &present)> m_presentHook;
     // The host->local transfer in progress (4.1 / 4.3): destination, pixels done, bytes not yet used.
     GSTransferCommand m_xfer{};
     bool m_xferActive = false;

@@ -84,7 +84,9 @@ void writeBits(uint word, uint value, uint mask)
 
 void countSilent(uint which)
 {
+#ifndef HIRES
     atomicAdd(counters[which], 1u);
+#endif
 }
 )GLSL";
 
@@ -147,10 +149,38 @@ layout(pixel_interlock_ordered) in;
 )GLSL";
 
     const char *kDrawFragmentBody = R"GLSL(
+// REAL: double in the GS-exact passes; float in the high-resolution passes (#define HIRES), where exactness to the
+// GS's 1x arithmetic does not apply and double precision is slow on most GPUs. Depth values stay double (exact).
+#ifdef HIRES
+#define REAL float
+#define LF(x) x
+#else
+#define REAL double
+#define LF(x) x##lf
+#endif
 layout(std430, binding = 2) readonly buffer Prims { uint prims[]; };
 layout(std430, binding = 3) readonly buffer States { uint states[]; };
 layout(std430, binding = 4) buffer Cluts { uint cluts[]; }; // the CLUT temporary buffer (snapshots)
 uniform int uDebug; // PS2X_GS_EXACT_DEBUG=1: every covered pixel written magenta (pipeline bypassed)
+#ifdef HIRES
+// High-resolution shadow pass (see GSExactRenderer::HiDrawPasses): the same pipeline evaluated at the centre of a
+// shadow-image pixel (a fractional GS position), reading and writing the shadow image of one frame buffer instead
+// of GS memory. Role 1: the primitive's frame buffer is that buffer (its Z too when ZBP == FBP); role 2: only its
+// Z buffer is (the frame is not shadowed in this pass).
+uniform int uHiTarget, uHiRole;
+uniform vec2 uHiScale;                                  // shadow pixels per GS pixel of the drawn buffer
+layout(r32ui, binding = 1) coherent uniform uimage2D uHiImg;
+// A Z buffer that is neither the drawn buffer nor shared with it (uHiZMode 1): a high-resolution copy made from GS
+// memory before the batch, read and written in primitive order like the frame (16-bit Z in the low bits).
+uniform int uHiZMode;
+layout(r32ui, binding = 2) coherent uniform uimage2D uHiZ;
+uniform uint uTgtTbp[3], uTgtValid[3];                  // shadowed buffers, as texture sources
+uniform vec2 uTgtScale[3];
+uniform sampler2D uTgtTex0, uTgtTex1, uTgtTex2;
+vec2 gHiC;    // sample centre in 1/16 GS pixels
+ivec2 gHiPix; // shadow pixel
+uint gHiCur;  // the shadow pixel's current value (frame and aliased Z writes go to the same word)
+#endif
 
 // "manual silent" counters (GSExactRenderer::UnsupportedSummary names them).
 const uint SILENT_Z_RANGE = 0u, SILENT_LINE_TIE = 1u, SILENT_BLEND_RESERVED = 2u, SILENT_DITHER32 = 3u,
@@ -259,20 +289,66 @@ uvec4 sampleLevel(float u0, float v0, uint lvl, bool bilinear)
     return uvec4(floor(c)); // manual silent on weight precision and rounding: truncation
 }
 
-// floor(num / den) for integer-valued doubles below 2^53, den > 0, exact whatever the division rounds to.
-double floorDiv(double num, double den)
+#ifdef HIRES
+// (b - a) x (p - a), computed from the lower of a, b so that the reversed edge gives exactly the negated value.
+float edgeFn(float ax, float ay, float bx, float by, float px, float py)
 {
-    double q = floor(num / den);
+    if (ay > by || (ay == by && ax > bx))
+        return -((ax - bx) * (py - by) - (ay - by) * (px - bx));
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+}
+
+// A texture that is a shadowed frame buffer (same base, width, 32-bit) is read from its shadow image, so a copy of
+// one buffer into another keeps the resolution. Never the buffer this pass draws into.
+int hiSource()
+{
+    uint psm = S(14);
+    if ((psm != 0u && psm != 1u) || S(13) != 8u)
+        return -1;
+    for (int i = 0; i < 3; ++i)
+        if (i != uHiTarget && uTgtValid[i] != 0u && S(12) == uTgtTbp[i])
+            return i;
+    return -1;
+}
+
+vec4 shadowFetch(int i, vec2 p, bool bilinear)
+{
+    // p in shadow pixels. Bilinear: the GS's (u - 0.5) weights are the GL texel-centre convention.
+    if (i == 0)
+        return bilinear ? textureLod(uTgtTex0, p / vec2(textureSize(uTgtTex0, 0)), 0.0)
+                        : texelFetch(uTgtTex0, clamp(ivec2(floor(p)), ivec2(0), textureSize(uTgtTex0, 0) - 1), 0);
+    if (i == 1)
+        return bilinear ? textureLod(uTgtTex1, p / vec2(textureSize(uTgtTex1, 0)), 0.0)
+                        : texelFetch(uTgtTex1, clamp(ivec2(floor(p)), ivec2(0), textureSize(uTgtTex1, 0) - 1), 0);
+    return bilinear ? textureLod(uTgtTex2, p / vec2(textureSize(uTgtTex2, 0)), 0.0)
+                    : texelFetch(uTgtTex2, clamp(ivec2(floor(p)), ivec2(0), textureSize(uTgtTex2, 0) - 1), 0);
+}
+
+uvec4 sampleShadow(int i, float u, float v, bool bilinear)
+{
+    vec4 c = shadowFetch(i, vec2(u, v) * uTgtScale[i], bilinear);
+    uvec4 t = uvec4(clamp(floor(c * 255.0 + 0.5), 0.0, 255.0));
+    uint texa = S(34);
+    if (S(14) == 1u) // RGB24 texture: alpha from TEXA
+        return expand24(t.r | (t.g << 8) | (t.b << 16), texa);
+    return t;
+}
+#endif
+
+// floor(num / den) for integer-valued doubles below 2^53, den > 0, exact whatever the division rounds to.
+REAL floorDiv(REAL num, REAL den)
+{
+    REAL q = floor(num / den);
     if (q * den > num)
-        q -= 1.0lf;
-    else if ((q + 1.0lf) * den <= num)
-        q += 1.0lf;
+        q -= LF(1.0);
+    else if ((q + LF(1.0)) * den <= num)
+        q += LF(1.0);
     return q;
 }
 
 // a0 + (a1 - a0) * n / d truncated, exactly (lines and sprites: manual silent on the DDA's precision;
 // the exact value truncated, UV kept to the UV register's 1/16 texel).
-double lerpFloor(double a0, double a1, double n, double d)
+REAL lerpFloor(REAL a0, REAL a1, REAL n, REAL d)
 {
     return a0 + floorDiv((a1 - a0) * n, d);
 }
@@ -305,7 +381,12 @@ bool gsShade(int prim, ivec2 pixIn)
     uint scx = S(8), scy = S(9);
     if (pix.x < int(scx & 0xFFFFu) || pix.x > int(scx >> 16) || pix.y < int(scy & 0xFFFFu) || pix.y > int(scy >> 16))
         return false;
-    int cx = pix.x * 16, cy = pix.y * 16; // pixel centre in 1/16 window units (2.4.4)
+    // Pixel centre in 1/16 window units (2.4.4); the shadow pass samples at its own pixel's centre.
+#ifdef HIRES
+    REAL cxd = gHiC.x, cyd = gHiC.y;
+#else
+    REAL cxd = REAL(pix.x * 16), cyd = REAL(pix.y * 16);
+#endif
 
     // SCANMSK
     uint scanmsk = S(36) & 3u;
@@ -313,10 +394,10 @@ bool gsShade(int prim, ivec2 pixIn)
         return false;
 
     // ---- 3.2.9 coverage and interpolation weights ----
-    double w0 = 1.0lf, w1 = 0.0lf, w2 = 0.0lf; // attribute = w0*a0 + w1*a1 + w2*a2
-    double sx = 0.0lf, sy = 0.0lf;            // sprite: fraction across x and y
-    double ln = 0.0lf, ld = 1.0lf;            // line: position along the major axis as ln / ld
-    double snx = 0.0lf, sdx = 1.0lf, sny = 0.0lf, sdy = 1.0lf; // sprite: sx = snx / sdx, sy = sny / sdy
+    REAL w0 = LF(1.0), w1 = LF(0.0), w2 = LF(0.0); // attribute = w0*a0 + w1*a1 + w2*a2
+    REAL sx = LF(0.0), sy = LF(0.0);            // sprite: fraction across x and y
+    REAL ln = LF(0.0), ld = LF(1.0);            // line: position along the major axis as ln / ld
+    REAL snx = LF(0.0), sdx = LF(1.0), sny = LF(0.0), sdy = LF(1.0); // sprite: sx = snx / sdx, sy = sny / sdy
     uint last = 0u;                           // vertex supplying flat colour (the one kicked last)
     if (type == 0u)
     {
@@ -331,41 +412,41 @@ bool gsShade(int prim, ivec2 pixIn)
     {
         // Line: each pixel owns the diamond |dx| + |dy| < 0.5 around its centre (Figure 3-5); the
         // pixels whose diamond the line passes through are drawn, except the one holding the end point.
-        double ax = double(vX(0u)), ay = double(vY(0u)), bx = double(vX(1u)), by = double(vY(1u));
-        double dx = bx - ax, dy = by - ay;
-        double pcx = double(cx), pcy = double(cy);
-        double best = abs(ax - pcx) + abs(ay - pcy);
+        REAL ax = REAL(vX(0u)), ay = REAL(vY(0u)), bx = REAL(vX(1u)), by = REAL(vY(1u));
+        REAL dx = bx - ax, dy = by - ay;
+        REAL pcx = cxd, pcy = cyd;
+        REAL best = abs(ax - pcx) + abs(ay - pcy);
         best = min(best, abs(bx - pcx) + abs(by - pcy));
-        if (dx != 0.0lf)
+        if (dx != LF(0.0))
         {
-            double t = (pcx - ax) / dx;
-            if (t > 0.0lf && t < 1.0lf)
+            REAL t = (pcx - ax) / dx;
+            if (t > LF(0.0) && t < LF(1.0))
                 best = min(best, abs(ay + t * dy - pcy));
         }
-        if (dy != 0.0lf)
+        if (dy != LF(0.0))
         {
-            double t = (pcy - ay) / dy;
-            if (t > 0.0lf && t < 1.0lf)
+            REAL t = (pcy - ay) / dy;
+            if (t > LF(0.0) && t < LF(1.0))
                 best = min(best, abs(ax + t * dx - pcx));
         }
-        if (best == 8.0lf)
+        if (best == LF(8.0))
             countSilent(SILENT_LINE_TIE); // touches the diamond's edge: manual silent, not drawn
-        if (best >= 8.0lf)
+        if (best >= LF(8.0))
             return false;
-        if (abs(bx - pcx) + abs(by - pcy) < 8.0lf)
+        if (abs(bx - pcx) + abs(by - pcy) < LF(8.0))
             return false; // "a pixel located at the endpoint of a line is not drawn"
         // The DDA steps along the major axis (supplement 1.1); position along it.
         bool xMajor = abs(dx) >= abs(dy);
         ln = xMajor ? pcx - ax : pcy - ay;
         ld = xMajor ? dx : dy;
-        if (ld < 0.0lf)
+        if (ld < LF(0.0))
         {
             ln = -ln;
             ld = -ld;
         }
-        ln = clamp(ln, 0.0lf, ld);
-        double t = ln / ld;
-        w0 = 1.0lf - t;
+        ln = clamp(ln, LF(0.0), ld);
+        REAL t = ln / ld;
+        w0 = LF(1.0) - t;
         w1 = t;
         last = 1u;
     }
@@ -373,48 +454,56 @@ bool gsShade(int prim, ivec2 pixIn)
     {
         // Sprite: top/left sides drawn, bottom/right not (Figure 3-9).
         int x0 = vX(0u), y0 = vY(0u), x1 = vX(1u), y1 = vY(1u);
-        if (cx < min(x0, x1) || cx >= max(x0, x1) || cy < min(y0, y1) || cy >= max(y0, y1))
+        if (cxd < REAL(min(x0, x1)) || cxd >= REAL(max(x0, x1)) || cyd < REAL(min(y0, y1)) || cyd >= REAL(max(y0, y1)))
             return false;
-        snx = double(cx - x0);
-        sdx = double(x1 - x0);
-        sny = double(cy - y0);
-        sdy = double(y1 - y0);
-        if (sdx < 0.0lf) { snx = -snx; sdx = -sdx; }
-        if (sdy < 0.0lf) { sny = -sny; sdy = -sdy; }
-        sx = double(cx - x0) / double(x1 - x0);
-        sy = double(cy - y0) / double(y1 - y0);
+        snx = cxd - REAL(x0);
+        sdx = REAL(x1 - x0);
+        sny = cyd - REAL(y0);
+        sdy = REAL(y1 - y0);
+        if (sdx < LF(0.0)) { snx = -snx; sdx = -sdx; }
+        if (sdy < LF(0.0)) { sny = -sny; sdy = -sdy; }
+        sx = (cxd - REAL(x0)) / REAL(x1 - x0);
+        sy = (cyd - REAL(y0)) / REAL(y1 - y0);
         last = 1u;
     }
     else
     {
         // Triangle: a centre on a side is drawn on left sides and on horizontal top sides only.
-        double px0 = double(vX(0u)), py0 = double(vY(0u));
-        double px1 = double(vX(1u)), py1 = double(vY(1u));
-        double px2 = double(vX(2u)), py2 = double(vY(2u));
-        double area = (px1 - px0) * (py2 - py0) - (py1 - py0) * (px2 - px0);
-        if (area == 0.0lf)
+        REAL px0 = REAL(vX(0u)), py0 = REAL(vY(0u));
+        REAL px1 = REAL(vX(1u)), py1 = REAL(vY(1u));
+        REAL px2 = REAL(vX(2u)), py2 = REAL(vY(2u));
+        REAL area = (px1 - px0) * (py2 - py0) - (py1 - py0) * (px2 - px0);
+        if (area == LF(0.0))
         {
             countSilent(SILENT_TRI_DEGENERATE);
             return false;
         }
-        double sgn = area > 0.0lf ? 1.0lf : -1.0lf;
-        double pcx = double(cx), pcy = double(cy);
+        REAL sgn = area > LF(0.0) ? LF(1.0) : -LF(1.0);
+        REAL pcx = cxd, pcy = cyd;
         // Edge k is opposite vertex k; inside when sgn * e > 0.
-        double e0 = sgn * ((px2 - px1) * (pcy - py1) - (py2 - py1) * (pcx - px1));
-        double e1 = sgn * ((px0 - px2) * (pcy - py2) - (py0 - py2) * (pcx - px2));
-        double e2 = sgn * ((px1 - px0) * (pcy - py0) - (py1 - py0) * (pcx - px0));
+#ifdef HIRES
+        // Each edge evaluated from its lower endpoint (by y, then x), so two triangles sharing an edge get exactly
+        // opposite values in float: no gaps or double hits along it.
+        REAL e0 = sgn * edgeFn(px1, py1, px2, py2, pcx, pcy);
+        REAL e1 = sgn * edgeFn(px2, py2, px0, py0, pcx, pcy);
+        REAL e2 = sgn * edgeFn(px0, py0, px1, py1, pcx, pcy);
+#else
+        REAL e0 = sgn * ((px2 - px1) * (pcy - py1) - (py2 - py1) * (pcx - px1));
+        REAL e1 = sgn * ((px0 - px2) * (pcy - py2) - (py0 - py2) * (pcx - px2));
+        REAL e2 = sgn * ((px1 - px0) * (pcy - py0) - (py1 - py0) * (pcx - px0));
+#endif
         // Edge direction as seen with the inside on the left of (dx, dy) * sgn, in y-down window
         // coordinates the inside normal is (-dy, dx): a left side has the inside to its right
         // (normal x > 0, so dy < 0), a top side is horizontal with the inside below (dx > 0).
-        double d0x = sgn * (px2 - px1), d0y = sgn * (py2 - py1);
-        double d1x = sgn * (px0 - px2), d1y = sgn * (py0 - py2);
-        double d2x = sgn * (px1 - px0), d2y = sgn * (py1 - py0);
-        bool in0 = e0 > 0.0lf || (e0 == 0.0lf && (d0y < 0.0lf || (d0y == 0.0lf && d0x > 0.0lf)));
-        bool in1 = e1 > 0.0lf || (e1 == 0.0lf && (d1y < 0.0lf || (d1y == 0.0lf && d1x > 0.0lf)));
-        bool in2 = e2 > 0.0lf || (e2 == 0.0lf && (d2y < 0.0lf || (d2y == 0.0lf && d2x > 0.0lf)));
+        REAL d0x = sgn * (px2 - px1), d0y = sgn * (py2 - py1);
+        REAL d1x = sgn * (px0 - px2), d1y = sgn * (py0 - py2);
+        REAL d2x = sgn * (px1 - px0), d2y = sgn * (py1 - py0);
+        bool in0 = e0 > LF(0.0) || (e0 == LF(0.0) && (d0y < LF(0.0) || (d0y == LF(0.0) && d0x > LF(0.0))));
+        bool in1 = e1 > LF(0.0) || (e1 == LF(0.0) && (d1y < LF(0.0) || (d1y == LF(0.0) && d1x > LF(0.0))));
+        bool in2 = e2 > LF(0.0) || (e2 == LF(0.0) && (d2y < LF(0.0) || (d2y == LF(0.0) && d2x > LF(0.0))));
         if (!(in0 && in1 && in2))
             return false;
-        double inv = 1.0lf / (sgn * area);
+        REAL inv = LF(1.0) / (sgn * area);
         w0 = e0 * inv;
         w1 = e1 * inv;
         w2 = e2 * inv;
@@ -431,7 +520,7 @@ bool gsShade(int prim, ivec2 pixIn)
         uint r0 = vRGBA(0u), r1 = vRGBA(1u);
         uint ci[4];
         for (uint k = 0u; k < 4u; ++k)
-            ci[k] = uint(clamp(lerpFloor(double((r0 >> (8u * k)) & 0xFFu), double((r1 >> (8u * k)) & 0xFFu), ln, ld), 0.0lf, 255.0lf));
+            ci[k] = uint(clamp(lerpFloor(REAL((r0 >> (8u * k)) & 0xFFu), REAL((r1 >> (8u * k)) & 0xFFu), ln, ld), LF(0.0), LF(255.0)));
         rgbaF = ci[0] | (ci[1] << 8) | (ci[2] << 16) | (ci[3] << 24);
     }
     else if (iip && type != 0u && type != 6u)
@@ -439,8 +528,8 @@ bool gsShade(int prim, ivec2 pixIn)
         precise vec4 c = vec4(0.0); // precise: the CPU port (CpuGs::shade) computes the same, unfused
         for (uint i = 0u; i < 3u; ++i)
         {
-            double w = i == 0u ? w0 : i == 1u ? w1 : w2;
-            if (w == 0.0lf) continue;
+            REAL w = i == 0u ? w0 : i == 1u ? w1 : w2;
+            if (w == LF(0.0)) continue;
             uint rgba = vRGBA(i);
             c += vec4(float(w)) * vec4(float(rgba & 0xFFu), float((rgba >> 8) & 0xFFu), float((rgba >> 16) & 0xFFu), float(rgba >> 24));
         }
@@ -465,16 +554,20 @@ bool gsShade(int prim, ivec2 pixIn)
     }
     else if (type == 1u || type == 2u)
     {
+#ifdef HIRES
+        zd = double(vZ(0u)) + floor((double(vZ(1u)) - double(vZ(0u))) * double(ln) / double(ld));
+#else
         zd = lerpFloor(double(vZ(0u)), double(vZ(1u)), ln, ld);
-        fogF = uint(clamp(lerpFloor(double(vFog(0u)), double(vFog(1u)), ln, ld), 0.0lf, 255.0lf));
+#endif
+        fogF = uint(clamp(lerpFloor(REAL(vFog(0u)), REAL(vFog(1u)), ln, ld), LF(0.0), LF(255.0)));
     }
     else
     {
         zd = w0 * double(vZ(0u)) + w1 * double(vZ(1u)) + w2 * double(vZ(2u));
-        double f = w0 * double(vFog(0u)) + w1 * double(vFog(1u)) + w2 * double(vFog(2u));
-        fogF = uint(clamp(floor(f + 1.0e-6lf), 0.0lf, 255.0lf));
+        REAL f = w0 * REAL(vFog(0u)) + w1 * REAL(vFog(1u)) + w2 * REAL(vFog(2u));
+        fogF = uint(clamp(floor(f + LF(1.0e-6)), LF(0.0), LF(255.0)));
     }
-    zd = clamp(floor(zd + 1.0e-6lf), 0.0lf, 4294967295.0lf);
+    zd = clamp(floor(zd + LF(1.0e-6)), LF(0.0), LF(4294967295.0));
     z = uint(zd);
 
     // ---- 3.4 texture mapping ----
@@ -485,54 +578,54 @@ bool gsShade(int prim, ivec2 pixIn)
         if (fst)
         {
             // UV in 1/16 texels.
-            double uu, vv;
+            REAL uu, vv;
             if (type == 6u)
             {
-                uu = lerpFloor(double(vUV(0u) & 0xFFFFu), double(vUV(1u) & 0xFFFFu), snx, sdx);
-                vv = lerpFloor(double(vUV(0u) >> 16), double(vUV(1u) >> 16), sny, sdy);
+                uu = lerpFloor(REAL(vUV(0u) & 0xFFFFu), REAL(vUV(1u) & 0xFFFFu), snx, sdx);
+                vv = lerpFloor(REAL(vUV(0u) >> 16), REAL(vUV(1u) >> 16), sny, sdy);
             }
             else if (type == 1u || type == 2u)
             {
-                uu = lerpFloor(double(vUV(0u) & 0xFFFFu), double(vUV(1u) & 0xFFFFu), ln, ld);
-                vv = lerpFloor(double(vUV(0u) >> 16), double(vUV(1u) >> 16), ln, ld);
+                uu = lerpFloor(REAL(vUV(0u) & 0xFFFFu), REAL(vUV(1u) & 0xFFFFu), ln, ld);
+                vv = lerpFloor(REAL(vUV(0u) >> 16), REAL(vUV(1u) >> 16), ln, ld);
             }
             else
             {
-                uu = w0 * double(vUV(0u) & 0xFFFFu) + w1 * double(vUV(1u) & 0xFFFFu) + w2 * double(vUV(2u) & 0xFFFFu);
-                vv = w0 * double(vUV(0u) >> 16) + w1 * double(vUV(1u) >> 16) + w2 * double(vUV(2u) >> 16);
+                uu = w0 * REAL(vUV(0u) & 0xFFFFu) + w1 * REAL(vUV(1u) & 0xFFFFu) + w2 * REAL(vUV(2u) & 0xFFFFu);
+                vv = w0 * REAL(vUV(0u) >> 16) + w1 * REAL(vUV(1u) >> 16) + w2 * REAL(vUV(2u) >> 16);
             }
-            u = float(uu / 16.0lf);
-            v = float(vv / 16.0lf);
-            q = type == 6u ? vF32(1u, 5u) : float(w0 * double(vF32(0u, 5u)) + w1 * double(vF32(1u, 5u)) + w2 * double(vF32(2u, 5u)));
+            u = float(uu / LF(16.0));
+            v = float(vv / LF(16.0));
+            q = type == 6u ? vF32(1u, 5u) : float(w0 * REAL(vF32(0u, 5u)) + w1 * REAL(vF32(1u, 5u)) + w2 * REAL(vF32(2u, 5u)));
         }
         else
         {
-            double s, t, qs, qt;
+            REAL s, t, qs, qt;
             if (type == 6u)
             {
                 // Sprite STQ: manual silent on how Q varies across the rectangle; S and Q along x,
                 // T and Q along y.
-                s = double(vF32(0u, 3u)) + sx * (double(vF32(1u, 3u)) - double(vF32(0u, 3u)));
-                t = double(vF32(0u, 4u)) + sy * (double(vF32(1u, 4u)) - double(vF32(0u, 4u)));
-                qs = double(vF32(0u, 5u)) + sx * (double(vF32(1u, 5u)) - double(vF32(0u, 5u)));
-                qt = double(vF32(0u, 5u)) + sy * (double(vF32(1u, 5u)) - double(vF32(0u, 5u)));
+                s = REAL(vF32(0u, 3u)) + sx * (REAL(vF32(1u, 3u)) - REAL(vF32(0u, 3u)));
+                t = REAL(vF32(0u, 4u)) + sy * (REAL(vF32(1u, 4u)) - REAL(vF32(0u, 4u)));
+                qs = REAL(vF32(0u, 5u)) + sx * (REAL(vF32(1u, 5u)) - REAL(vF32(0u, 5u)));
+                qt = REAL(vF32(0u, 5u)) + sy * (REAL(vF32(1u, 5u)) - REAL(vF32(0u, 5u)));
             }
             else
             {
-                s = w0 * double(vF32(0u, 3u)) + w1 * double(vF32(1u, 3u)) + w2 * double(vF32(2u, 3u));
-                t = w0 * double(vF32(0u, 4u)) + w1 * double(vF32(1u, 4u)) + w2 * double(vF32(2u, 4u));
-                qs = w0 * double(vF32(0u, 5u)) + w1 * double(vF32(1u, 5u)) + w2 * double(vF32(2u, 5u));
+                s = w0 * REAL(vF32(0u, 3u)) + w1 * REAL(vF32(1u, 3u)) + w2 * REAL(vF32(2u, 3u));
+                t = w0 * REAL(vF32(0u, 4u)) + w1 * REAL(vF32(1u, 4u)) + w2 * REAL(vF32(2u, 4u));
+                qs = w0 * REAL(vF32(0u, 5u)) + w1 * REAL(vF32(1u, 5u)) + w2 * REAL(vF32(2u, 5u));
                 qt = qs;
             }
-            if (qs == 0.0lf || qt == 0.0lf)
+            if (qs == LF(0.0) || qt == LF(0.0))
             {
                 countSilent(SILENT_Q_ZERO);
-                qs = qs == 0.0lf ? 1.0lf : qs;
-                qt = qt == 0.0lf ? 1.0lf : qt;
+                qs = qs == LF(0.0) ? LF(1.0) : qs;
+                qt = qt == LF(0.0) ? LF(1.0) : qt;
             }
             // 3.4.4: u = USIZE x S/Q, v = VSIZE x T/Q
-            u = float(s / qs * double(1u << S(15)));
-            v = float(t / qt * double(1u << S(16)));
+            u = float(s / qs * REAL(1u << S(15)));
+            v = float(t / qt * REAL(1u << S(16)));
             q = float(qs);
         }
         // "u and v values that the GS can process are in the range of -2047 to +2047"
@@ -557,6 +650,12 @@ bool gsShade(int prim, ivec2 pixIn)
         lvTbp[5] = (m2lo >> 20) | ((m2hi & 0x3u) << 12); lvTbw[5] = (m2hi >> 2) & 0x3Fu;
         lvTbp[6] = (m2hi >> 8) & 0x3FFFu; lvTbw[6] = (m2hi >> 22) & 0x3Fu;
         uvec4 ct;
+#ifdef HIRES
+        int hs = hiSource();
+        if (hs >= 0)
+            ct = sampleShadow(hs, u, v, (lod <= 0.0 ? mmag : (mmin & 1u)) == 1u);
+        else
+#endif
         if (lod <= 0.0)
             ct = sampleLevel(u, v, 0u, mmag == 1u); // "0.0 or less": level 0 with MMAG
         else if (mmin <= 1u)
@@ -664,8 +763,20 @@ void gsWrite()
 {
     bool pass = true;
 
+#ifdef HIRES
+    // Z shares the shadow word when ZBP == FBP (role 1) or is the shadowed buffer (role 2); otherwise it is read
+    // from GS memory (the main pass keeps it) and not written here.
+    bool zHi = uHiRole == 2 || S(5) == S(1);
+    bool zImg = !zHi && uHiZMode != 0;
+    gHiCur = imageLoad(uHiImg, gHiPix).r;
+    uint fold = uHiRole == 1 ? gHiCur : mem[fword];
+    uint zold = zHi ? gHiCur : zImg ? imageLoad(uHiZ, gHiPix).r : mem[zword];
+    uint zsh = zImg ? 0u : zshift;
+#else
     uint fold = mem[fword];
     uint zold = mem[zword];
+#endif
+#ifndef HIRES
     if (uDebug == 1)
         writeBits(fword, 0xFFFF00FFu, 0xFFFFFFFFu);
     else if (uDebug == 2)
@@ -676,6 +787,7 @@ void gsWrite()
         writeBits(fword, cluts[S(21) * 512u + uint(pix.x & 511)] | 0xFF000000u, 0xFFFFFFFFu);
     if (uDebug != 0)
         pass = false;
+#endif
 
     // Destination colour as the blend and the destination alpha test see it.
     uvec3 cd;
@@ -705,7 +817,11 @@ void gsWrite()
     // ---- 3.7.4 depth test ----
     if (pass)
     {
+#ifdef HIRES
+        uint zs = zpsm == 49u ? (zold & 0xFFFFFFu) : (zpsm == 50u || zpsm == 58u) ? ((zold >> zsh) & 0xFFFFu) : zold;
+#else
         uint zs = zpsm == 49u ? (zold & 0xFFFFFFu) : (zpsm == 50u || zpsm == 58u) ? ((zold >> zshift) & 0xFFFFu) : zold;
+#endif
         if (ztst == 0u) pass = false;
         else if (ztst == 2u) pass = z >= zs;
         else if (ztst == 3u) pass = z > zs;
@@ -749,24 +865,51 @@ void gsWrite()
             uint abit = (cv.a >> 7) | fba;
             uint p = (rgb.r >> 3) | ((rgb.g >> 3) << 5) | ((rgb.b >> 3) << 10) | ((abit & 1u) << 15);
             uint m = ((writeRgb ? 0x7FFFu : 0u) | (writeA ? 0x8000u : 0u)) & ~fmask16;
+#ifndef HIRES
             writeBits(fword, p << fshift, m << fshift);
+#endif
         }
         else
         {
             uint a = fpsm == 0u ? (cv.a | (fba << 7)) : 0u;
             uint p = rgb.r | (rgb.g << 8) | (rgb.b << 16) | (a << 24);
             uint m = (writeRgb ? 0x00FFFFFFu : 0u) | ((writeA && fpsm == 0u) ? 0xFF000000u : 0u);
+#ifdef HIRES
+            if (uHiRole == 1)
+            {
+                uint mm = m & ~fbmsk;
+                gHiCur = (gHiCur & ~mm) | (p & mm);
+            }
+#else
             writeBits(fword, p, m & ~fbmsk); // PSMCT24: bits 31:24 "Not used", left as they are
+#endif
         }
         if (writeZ && zmsk == 0u)
         {
+#ifdef HIRES
+            // 32/24-bit Z only (16-bit Z on a shadowed buffer makes it stale instead, see HiClassify).
+            if (zHi && zpsm != 50u && zpsm != 58u)
+            {
+                uint zm = zpsm == 49u ? 0xFFFFFFu : 0xFFFFFFFFu;
+                gHiCur = (gHiCur & ~zm) | (z & zm);
+            }
+            else if (zImg)
+            {
+                uint zm = zpsm == 49u ? 0xFFFFFFu : (zpsm == 50u || zpsm == 58u) ? 0xFFFFu : 0xFFFFFFFFu;
+                imageStore(uHiZ, gHiPix, uvec4((zold & ~zm) | (z & zm)));
+            }
+#else
             if (zpsm == 50u || zpsm == 58u)
                 writeBits(zword, (z & 0xFFFFu) << zshift, 0xFFFFu << zshift);
             else if (zpsm == 49u)
                 writeBits(zword, z, 0xFFFFFFu); // bits 31:24 "Not used"
             else
                 writeBits(zword, z, 0xFFFFFFFFu);
+#endif
         }
+#ifdef HIRES
+        imageStore(uHiImg, gHiPix, uvec4(gHiCur));
+#endif
     }
 
 }
@@ -781,6 +924,105 @@ void main()
     beginInvocationInterlockARB();
     gsWrite();
     endInvocationInterlockARB();
+}
+)GLSL";
+
+    // High-resolution shadow pass: the primitives of the batch that draw into shadow buffer uHiTarget in role
+    // uHiRole (prim word 27: frame-role mask, 28: Z-role mask), each over its bounding box in shadow pixels.
+    const char *kHiVertex = R"GLSL(#version 430
+layout(std430, binding = 2) readonly buffer Prims { uint prims[]; };
+layout(std430, binding = 3) readonly buffer States { uint states[]; };
+uniform int uHiTarget, uHiRole;
+uniform vec2 uHiScale;
+uniform ivec2 uHiSize;
+uniform int uHiZMode; // 0: primitives that only write Z (prim word 29) have nothing to do in this pass
+flat out int vPrim;
+
+int wcoord(uint pk, int shiftBits, uint offset)
+{
+    return int((pk >> uint(shiftBits)) & 0xFFFFu) - int(offset);
+}
+
+void main()
+{
+    int prim = gl_VertexID / 6;
+    int corner = gl_VertexID % 6;
+    vPrim = prim;
+    uint pb = uint(prim) * 32u;
+    uint roles = prims[pb + (uHiRole == 1 ? 27u : 28u)];
+    if (prims[pb + 26u] != 0u || ((roles >> uint(uHiTarget)) & 1u) == 0u || (uHiZMode == 0 && prims[pb + 29u] != 0u))
+    {
+        gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+        return;
+    }
+    uint sb = prims[pb + 25u] * 48u;
+    uint type = states[sb] & 7u;
+    uint n = type == 0u ? 1u : (type == 1u || type == 2u || type == 6u) ? 2u : 3u;
+    uint ofx = states[sb + 10u], ofy = states[sb + 11u];
+    int minX = 1 << 30, minY = 1 << 30, maxX = -(1 << 30), maxY = -(1 << 30);
+    for (uint i = 0u; i < n; ++i)
+    {
+        uint xy = prims[pb + i * 8u];
+        int x = wcoord(xy, 0, ofx), y = wcoord(xy, 16, ofy);
+        minX = min(minX, x); minY = min(minY, y);
+        maxX = max(maxX, x); maxY = max(maxY, y);
+    }
+    int x0 = (minX >> 4) - 1, y0 = (minY >> 4) - 1;
+    int x1 = (maxX >> 4) + 1, y1 = (maxY >> 4) + 1;
+    uint sx = states[sb + 8u], sy = states[sb + 9u];
+    x0 = max(x0, int(sx & 0xFFFFu)); x1 = min(x1, int(sx >> 16));
+    y0 = max(y0, int(sy & 0xFFFFu)); y1 = min(y1, int(sy >> 16));
+    x0 = max(x0, 0); y0 = max(y0, 0);
+    if (x0 > x1 || y0 > y1)
+    {
+        gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+        return;
+    }
+    // GS pixels x0..x1 cover GS positions [x0 - 0.5, x1 + 0.5); shadow pixel X samples (X + 0.5) / scale - 0.5.
+    int hx0 = max(int(floor(float(x0) * uHiScale.x)) - 1, 0), hy0 = max(int(floor(float(y0) * uHiScale.y)) - 1, 0);
+    int hx1 = min(int(ceil(float(x1 + 1) * uHiScale.x)) + 1, uHiSize.x), hy1 = min(int(ceil(float(y1 + 1) * uHiScale.y)) + 1, uHiSize.y);
+    if (hx0 >= hx1 || hy0 >= hy1)
+    {
+        gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+        return;
+    }
+    int cx = (corner == 1 || corner == 2 || corner == 4) ? hx1 : hx0;
+    int cy = (corner == 2 || corner == 4 || corner == 5) ? hy1 : hy0;
+    gl_Position = vec4(float(cx) / float(uHiSize.x) * 2.0 - 1.0, float(cy) / float(uHiSize.y) * 2.0 - 1.0, 0.0, 1.0);
+}
+)GLSL";
+
+    const char *kHiFragmentMain = R"GLSL(
+flat in int vPrim;
+void main()
+{
+    gHiPix = ivec2(gl_FragCoord.xy);
+    // GS position of this shadow pixel's centre, in 1/16 pixels, and the GS pixel whose square holds it.
+    gHiC = (gl_FragCoord.xy / uHiScale - 0.5) * 16.0;
+    ivec2 gp = ivec2(floor((gHiC + 8.0) / 16.0));
+    if (!gsShade(vPrim, gp))
+        discard;
+    beginInvocationInterlockARB();
+    gsWrite();
+    endInvocationInterlockARB();
+}
+)GLSL";
+
+    // Shadow image rectangle from GS memory (PSMCT32, nearest): after writes the shadow passes do not mirror.
+    const char *kHiResyncBody = R"GLSL(
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(r32ui, binding = 1) writeonly uniform uimage2D uHiImg;
+uniform uint uFbp, uFbw, uPsm; // buffer base (2048-word units), width, PSM (0 for a frame buffer)
+uniform vec2 uScale;
+uniform ivec4 uRect; // shadow pixels x, y, w, h
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= uRect.z || p.y >= uRect.w)
+        return;
+    ivec2 X = uRect.xy + p;
+    uvec2 g = uvec2(floor((vec2(X) + 0.5) / uScale));
+    imageStore(uHiImg, X, uvec4(readPixel(uPsm, uFbp * 32u, uFbw, g.x & 2047u, g.y & 2047u)));
 }
 )GLSL";
 
@@ -948,6 +1190,22 @@ void main()
 }
 )GLSL";
 
+    const char *kTexReadBody = R"GLSL(
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba8, binding = 0) uniform writeonly image2D uImg;
+uniform uint uFbp, uFbw, uX, uY, uW, uH;
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= uW || p.y >= uH)
+        return;
+    uint word, shift;
+    pixelWord(0u, uFbp * 32u, uFbw, (uX + p.x) & 2047u, (uY + p.y) & 2047u, word, shift);
+    uint v = mem[word];
+    imageStore(uImg, ivec2(p), vec4(float(v & 255u), float((v >> 8u) & 255u), float((v >> 16u) & 255u), float(v >> 24u)) / 255.0);
+}
+)GLSL";
+
     const char *kCrtcVertex = R"GLSL(#version 430
 void main()
 {
@@ -971,10 +1229,17 @@ uniform uvec4 uDispFb[2];   // FBP, FBW, PSM, 0
 uniform ivec2 uDb[2];       // DBX, DBY
 uniform int uMmod, uAmod, uSlbg, uAlp;
 uniform uvec3 uBg;
+// High-resolution canvas: uHiCanvas canvas pixels per PS2 canvas pixel ((1, 1): the PS2's own). A circuit whose
+// buffer has a shadow image (uHiSrc >= 0, scale uHiSrcScale) is read from it at the fractional buffer position.
+uniform vec2 uHiCanvas;
+uniform int uHiSrc[2];
+uniform vec2 uHiSrcScale[2];
+uniform sampler2D uHiSrc0, uHiSrc1;
 out vec4 oColor;
 
-// One read circuit at output position (vck, line): colour, alpha, inside its rectangle.
-bool circuit(int c, int vck, int line, out uvec3 rgb, out uint a)
+// One read circuit at output position (vck, line) (fvck, fline: the same, fractional): colour, alpha, inside its
+// rectangle.
+bool circuit(int c, int vck, int line, float fvck, float fline, out uvec3 rgb, out uint a)
 {
     rgb = uvec3(0u);
     a = 0u;
@@ -994,6 +1259,19 @@ bool circuit(int c, int vck, int line, out uvec3 rgb, out uint a)
         by = k / uMag[c].y;
     int bx = (vck - d.x) / uMag[c].x;
     uint psm = uDispFb[c].z;
+    if (uHiSrc[c] >= 0)
+    {
+        float fk = fline - float(d.y);
+        float fby = (uInterlace != 0 && uFfmd != 0) ? fk * 0.5 / float(uMag[c].y) : fk / float(uMag[c].y);
+        float fbx = (fvck - float(d.x)) / float(uMag[c].x);
+        vec2 p = (vec2(float(uDb[c].x), float(uDb[c].y)) + vec2(fbx, fby)) * uHiSrcScale[c];
+        vec4 t = c == 0 ? texelFetch(uHiSrc0, clamp(ivec2(floor(p)), ivec2(0), textureSize(uHiSrc0, 0) - 1), 0)
+                        : texelFetch(uHiSrc1, clamp(ivec2(floor(p)), ivec2(0), textureSize(uHiSrc1, 0) - 1), 0);
+        uvec4 v = uvec4(clamp(floor(t * 255.0 + 0.5), 0.0, 255.0));
+        rgb = v.rgb;
+        a = psm == 1u ? 0x80u : v.a;
+        return true;
+    }
     uint raw = readPixel(psm, uDispFb[c].x * 32u, uDispFb[c].y, uint(uDb[c].x + bx) & 2047u, uint(uDb[c].y + by) & 2047u);
     if (psm == 2u || psm == 10u)
     {
@@ -1010,15 +1288,17 @@ bool circuit(int c, int vck, int line, out uvec3 rgb, out uint a)
 
 void main()
 {
-    int x = int(gl_FragCoord.x), y = int(gl_FragCoord.y);
+    vec2 f = gl_FragCoord.xy / uHiCanvas; // PS2 canvas position
+    int x = int(floor(f.x)), y = int(floor(f.y));
     int line = uOrigin.y + y;
     if (uInterlace != 0 && uAllLines == 0 && ((line - uOrigin.y) & 1) != uField)
         discard;
     int vck = uOrigin.x + x * uVckStep;
+    float fvck = float(uOrigin.x) + f.x * float(uVckStep), fline = float(uOrigin.y) + f.y;
     uvec3 c1, c2;
     uint a1, a2;
-    bool in1 = circuit(0, vck, line, c1, a1);
-    bool in2 = circuit(1, vck, line, c2, a2);
+    bool in1 = circuit(0, vck, line, fvck, fline, c1, a1);
+    bool in2 = circuit(1, vck, line, fvck, fline, c2, a2);
     // OUT2: circuit 2 inside its rectangle, else BGCOLOR.
     uvec3 out2 = in2 ? c2 : uBg;
     uvec3 rd = uSlbg != 0 ? uBg : out2;
@@ -1229,6 +1509,23 @@ void GSExactRenderer::EnsureGl()
             }
         }
     }
+    {
+        const unsigned cs = compile(GL_COMPUTE_SHADER, std::string("#version 430\n") + kCommonGlsl + kTexReadBody);
+        if (cs)
+        {
+            m_texReadProgram = glCreateProgram();
+            glAttachShader(m_texReadProgram, cs);
+            glLinkProgram(m_texReadProgram);
+            glDeleteShader(cs);
+            GLint ok = 0;
+            glGetProgramiv(m_texReadProgram, GL_LINK_STATUS, &ok);
+            if (!ok)
+            {
+                glDeleteProgram(m_texReadProgram);
+                m_texReadProgram = 0;
+            }
+        }
+    }
     if (!m_drawProgram || !m_crtcProgram || !m_clutProgram || !m_xferProgram || !m_seqProgram)
     {
         m_glFailed = true;
@@ -1327,6 +1624,54 @@ void GSExactRenderer::EnsureGl()
     glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_WIDTH, 2048);
     glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_HEIGHT, 2048);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // High-resolution shadow buffers (PS2X_GS_HIRES=0: off, everything at the GS's 1x as before).
+    {
+        const char *v = std::getenv("PS2X_GS_HIRES");
+        if (!(v && v[0] == '0'))
+        {
+            m_hiProgram = link(compile(GL_VERTEX_SHADER, kHiVertex),
+                               compile(GL_FRAGMENT_SHADER, std::string(kDrawFragmentHead) + "#define HIRES\n" + kCommonGlsl + kDrawFragmentBody +
+                                                               kHiFragmentMain));
+            const unsigned cs = compile(GL_COMPUTE_SHADER, std::string("#version 430\n") + kCommonGlsl + kHiResyncBody);
+            if (cs)
+            {
+                m_hiResyncProgram = glCreateProgram();
+                glAttachShader(m_hiResyncProgram, cs);
+                glLinkProgram(m_hiResyncProgram);
+                glDeleteShader(cs);
+                GLint ok = 0;
+                glGetProgramiv(m_hiResyncProgram, GL_LINK_STATUS, &ok);
+                if (!ok)
+                {
+                    glDeleteProgram(m_hiResyncProgram);
+                    m_hiResyncProgram = 0;
+                }
+            }
+            if (m_hiProgram && m_hiResyncProgram)
+            {
+                glGenFramebuffers(1, &m_hiFbo);
+                glBindFramebuffer(GL_FRAMEBUFFER, m_hiFbo);
+                glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_WIDTH, 4096);
+                glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_HEIGHT, 4096);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glGenFramebuffers(2, m_hiBlitFbo);
+                const uint32_t fbps[kHiTargets] = {224u, 0u, 112u};
+                const uint32_t gw[kHiTargets] = {496u, 512u, 512u}, gh[kHiTargets] = {384u, 448u, 448u};
+                for (int i = 0; i < kHiTargets; ++i)
+                {
+                    HiTarget &t = m_hi[i];
+                    t.fbp = fbps[i];
+                    t.gsW = gw[i];
+                    t.gsH = gh[i];
+                    pageSpan(GS_PSM_CT32, t.fbp * 32u, 8u, 0u, 0u, t.gsW, t.gsH, t.firstPage, t.pageCount);
+                }
+                m_hiOn = true;
+                std::cerr << "[gs-exact] high-resolution shadow buffers on (PS2X_GS_HIRES=0: off)" << std::endl;
+            }
+            else
+                std::cerr << "[gs-exact] high-resolution shadow programs failed: off" << std::endl;
+        }
+    }
     m_cpuNewer.fill(true);
     m_gpuNewer.fill(false);
     ++m_batchGen;
@@ -1381,6 +1726,29 @@ void GSExactRenderer::Release()
     m_imgBuf = 0;
     glDeleteVertexArrays(1, &m_vao);
     glDeleteFramebuffers(1, &m_drawFbo);
+    if (m_hiProgram)
+        glDeleteProgram(m_hiProgram);
+    if (m_hiResyncProgram)
+        glDeleteProgram(m_hiResyncProgram);
+    m_hiProgram = m_hiResyncProgram = 0;
+    if (m_hiFbo)
+        glDeleteFramebuffers(1, &m_hiFbo);
+    if (m_hiZTex)
+        glDeleteTextures(1, &m_hiZTex);
+    m_hiZTex = 0;
+    m_hiZW = m_hiZH = 0;
+    if (m_hiBlitFbo[0])
+        glDeleteFramebuffers(2, m_hiBlitFbo);
+    m_hiFbo = m_hiBlitFbo[0] = m_hiBlitFbo[1] = 0;
+    for (HiTarget &t : m_hi)
+    {
+        if (t.tex)
+            glDeleteTextures(1, &t.tex);
+        t.tex = 0;
+        t.w = t.h = 0;
+        t.valid = false;
+    }
+    m_hiOn = false;
     if (m_canvasTex)
         glDeleteTextures(1, &m_canvasTex);
     if (m_canvasFbo)
@@ -1563,6 +1931,7 @@ void GSExactRenderer::InvalidatePages(uint32_t first, uint32_t count)
         m_cpuNewer[p] = true;
         m_gpuNewer[p] = false;
     }
+    HiTouchPages(first, count);
     ++m_batchGen;
 }
 
@@ -2216,6 +2585,7 @@ bool GSExactRenderer::BeginTransfer(const GSTransferCommand &command)
         else
             m_xferMirror = true;
     }
+    HiTouchPages(first, count);
     return true;
 }
 
@@ -2236,6 +2606,7 @@ bool GSExactRenderer::WriteFrameFromTexture(unsigned glTexture, const GSNativeTa
         m_pageEpoch[p] = m_epochCounter;
         m_gpuNewer[p] = true; // written on the GPU only; CPU users pull it
     }
+    HiTouchPages(first, count); // WriteHiResFromTexture, when it follows, replaces the shadow copy
     ++m_batchGen;
     UploadDirtyPages();
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
@@ -2266,6 +2637,40 @@ bool GSExactRenderer::WriteFrameFromTexture(unsigned glTexture, const GSNativeTa
     glBindTexture(GL_TEXTURE_2D, 0);
     glUseProgram(0);
     Note("native-picture");
+    return true;
+}
+
+bool GSExactRenderer::ReadFrameToTexture(unsigned glTexture, const GSNativeTarget &t)
+{
+    if (!m_glReady || !m_texReadProgram || t.w <= 0 || t.h <= 0)
+        return false;
+    NoteFlush("native");
+    FlushDraws(); // drawing queued before the read comes first
+    UploadDirtyPages();
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_memBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_swzBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_counterBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_psmBuf);
+    glUseProgram(m_texReadProgram);
+    static GLint u[6] = {-2};
+    if (u[0] == -2)
+    {
+        const char *names[6] = {"uFbp", "uFbw", "uX", "uY", "uW", "uH"};
+        for (int i = 0; i < 6; ++i)
+            u[i] = glGetUniformLocation(m_texReadProgram, names[i]);
+    }
+    glBindImageTexture(0, glTexture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glUniform1ui(u[0], t.fbp);
+    glUniform1ui(u[1], t.fbw);
+    glUniform1ui(u[2], static_cast<uint32_t>(t.x));
+    glUniform1ui(u[3], static_cast<uint32_t>(t.y));
+    glUniform1ui(u[4], static_cast<uint32_t>(t.w));
+    glUniform1ui(u[5], static_cast<uint32_t>(t.h));
+    glDispatchCompute((static_cast<uint32_t>(t.w) + 15u) / 16u, (static_cast<uint32_t>(t.h) + 15u) / 16u, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glUseProgram(0);
     return true;
 }
 
@@ -2767,6 +3172,335 @@ void GSExactRenderer::CpuClutLoad(const ClutLoad &l, const uint32_t *src, uint32
     }
 }
 
+// ---- high-resolution shadow buffers (see HiTarget in the header) ---------------------------------------
+
+void GSExactRenderer::HiUpdateSizes()
+{
+    if (!m_hiOn || m_outW <= 0 || m_outH <= 0 || m_hiCanvasW == 0u || m_hiCanvasH == 0u)
+        return;
+    // Window pixels per PS2 canvas pixel; a display buffer pixel is a canvas pixel (MAGH = the canvas step).
+    const float sx = static_cast<float>(m_outW) / static_cast<float>(m_hiCanvasW);
+    const float sy = static_cast<float>(m_outH) / static_cast<float>(m_hiCanvasH);
+    const int W = std::clamp(static_cast<int>(std::lround(512.0f * sx)), 512, 4096);
+    const int H = std::clamp(static_cast<int>(std::lround(448.0f * sy)), 448, 4096);
+    for (int i = 0; i < kHiTargets; ++i)
+    {
+        HiTarget &t = m_hi[i];
+        if (t.tex && t.w == W && t.h == H)
+            continue;
+        if (!t.tex)
+            glGenTextures(1, &t.tex);
+        glBindTexture(GL_TEXTURE_2D, t.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        t.w = W;
+        t.h = H;
+        // Every image has the display's size: the work buffer is shown stretched (496 x 384 -> 512 x 448, the
+        // TYPE-C copy), so its copy into a display buffer maps shadow pixels 1:1.
+        t.sx = static_cast<float>(W) / static_cast<float>(t.gsW);
+        t.sy = static_cast<float>(H) / static_cast<float>(t.gsH);
+        t.valid = true;
+        t.stale = true;
+        t.staleRect[0] = 0, t.staleRect[1] = 0, t.staleRect[2] = static_cast<int>(t.gsW), t.staleRect[3] = static_cast<int>(t.gsH);
+        t.staleAfter = false;
+        Note("hires-resize");
+    }
+    if (!m_hiZTex || m_hiZW != W || m_hiZH != H)
+    {
+        if (!m_hiZTex)
+            glGenTextures(1, &m_hiZTex);
+        glBindTexture(GL_TEXTURE_2D, m_hiZTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, W, H, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        m_hiZW = W;
+        m_hiZH = H;
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void GSExactRenderer::HiMarkStale(int i, uint32_t first, uint32_t count, bool after)
+{
+    HiTarget &t = m_hi[i];
+    if (!t.valid || count == 0u)
+        return;
+    int x0 = 1 << 30, y0 = 1 << 30, x1 = -1, y1 = -1;
+    for (uint32_t k = 0; k < count && k < kPageCount; ++k)
+    {
+        const uint32_t pg = (first + k) % kPageCount;
+        if (pg < t.firstPage || pg >= t.firstPage + t.pageCount)
+            continue;
+        const uint32_t rel = pg - t.firstPage; // PSMCT32 pages of 64 x 32, 8 per row (FBW 8)
+        const int px = static_cast<int>((rel % 8u) * 64u), py = static_cast<int>((rel / 8u) * 32u);
+        x0 = std::min(x0, px), y0 = std::min(y0, py), x1 = std::max(x1, px + 64), y1 = std::max(y1, py + 32);
+    }
+    x1 = std::min(x1, static_cast<int>(t.gsW));
+    y1 = std::min(y1, static_cast<int>(t.gsH));
+    if (x0 >= x1 || y0 >= y1)
+        return;
+    bool &flag = after ? t.staleAfter : t.stale;
+    int *r = after ? t.staleAfterRect : t.staleRect;
+    if (!flag)
+        r[0] = x0, r[1] = y0, r[2] = x1, r[3] = y1;
+    else
+        r[0] = std::min(r[0], x0), r[1] = std::min(r[1], y0), r[2] = std::max(r[2], x1), r[3] = std::max(r[3], y1);
+    flag = true;
+}
+
+void GSExactRenderer::HiTouchPages(uint32_t first, uint32_t count)
+{
+    if (!m_hiOn)
+        return;
+    for (int i = 0; i < kHiTargets; ++i)
+        HiMarkStale(i, first, count, false);
+}
+
+void GSExactRenderer::HiResync(int i, const int rect[4])
+{
+    HiTarget &t = m_hi[i];
+    if (!t.valid || !t.tex || !m_hiResyncProgram)
+        return;
+    const int x0 = std::max(static_cast<int>(std::floor(static_cast<float>(rect[0]) * t.sx)), 0);
+    const int y0 = std::max(static_cast<int>(std::floor(static_cast<float>(rect[1]) * t.sy)), 0);
+    const int x1 = std::min(static_cast<int>(std::ceil(static_cast<float>(rect[2]) * t.sx)), t.w);
+    const int y1 = std::min(static_cast<int>(std::ceil(static_cast<float>(rect[3]) * t.sy)), t.h);
+    if (x0 >= x1 || y0 >= y1)
+        return;
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                    GL_TEXTURE_FETCH_BARRIER_BIT);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_memBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_swzBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_counterBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_psmBuf);
+    glUseProgram(m_hiResyncProgram);
+    glBindImageTexture(1, t.tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+    glUniform1ui(glGetUniformLocation(m_hiResyncProgram, "uFbp"), t.fbp);
+    glUniform1ui(glGetUniformLocation(m_hiResyncProgram, "uFbw"), 8u);
+    glUniform1ui(glGetUniformLocation(m_hiResyncProgram, "uPsm"), 0u);
+    glUniform2f(glGetUniformLocation(m_hiResyncProgram, "uScale"), t.sx, t.sy);
+    glUniform4i(glGetUniformLocation(m_hiResyncProgram, "uRect"), x0, y0, x1 - x0, y1 - y0);
+    glDispatchCompute(static_cast<GLuint>((x1 - x0 + 15) / 16), static_cast<GLuint>((y1 - y0 + 15) / 16), 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+    glBindImageTexture(1, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+    glUseProgram(0);
+    Note("hires-resync-fbp" + std::to_string(t.fbp) + (rect[2] - rect[0] >= static_cast<int>(t.gsW) && rect[3] - rect[1] >= static_cast<int>(t.gsH) ? "-full" : "-part"));
+}
+
+// after: the batch has run, GS memory holds its writes: those over shadowed buffers become stale (copied when
+// the buffer is next used, skipped if a native picture replaces it first). Otherwise: copy the stale buffers this
+// batch uses (useOnly) or all of them.
+void GSExactRenderer::HiResyncPending(bool after, bool useOnly)
+{
+    if (!m_hiOn)
+        return;
+    for (int i = 0; i < kHiTargets; ++i)
+    {
+        HiTarget &t = m_hi[i];
+        if (after)
+        {
+            if (!t.staleAfter)
+            {
+                t.batchUse = false;
+                continue;
+            }
+            t.batchUse = false;
+            t.staleAfter = false;
+            const int *r = t.staleAfterRect;
+            if (!t.stale)
+                std::copy(r, r + 4, t.staleRect);
+            else
+                t.staleRect[0] = std::min(t.staleRect[0], r[0]), t.staleRect[1] = std::min(t.staleRect[1], r[1]),
+                t.staleRect[2] = std::max(t.staleRect[2], r[2]), t.staleRect[3] = std::max(t.staleRect[3], r[3]);
+            t.stale = true;
+            continue;
+        }
+        if (!t.stale || (useOnly && !t.batchUse))
+            continue;
+        t.stale = false;
+        HiResync(i, t.staleRect);
+    }
+}
+
+void GSExactRenderer::HiDrawPasses()
+{
+    bool any = false;
+    for (const HiTarget &t : m_hi)
+        any |= t.batchFrame || t.batchZ;
+    if (!any || !m_hiProgram)
+        return;
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_memBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_swzBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_primBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_stateBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, m_clutBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_counterBuf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_psmBuf);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_hiFbo);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glUseProgram(m_hiProgram);
+    // Uniform locations, looked up once per program (this runs on most flushes).
+    static unsigned s_prog = 0;
+    static std::map<std::string, GLint> s_loc;
+    if (s_prog != m_hiProgram)
+    {
+        s_prog = m_hiProgram;
+        s_loc.clear();
+    }
+    auto U = [&](const char *n) {
+        auto it = s_loc.find(n);
+        if (it == s_loc.end())
+            it = s_loc.emplace(n, glGetUniformLocation(m_hiProgram, n)).first;
+        return it->second;
+    };
+    glUniform1i(U("uDebug"), 0);
+    const char *texNames[kHiTargets] = {"uTgtTex0", "uTgtTex1", "uTgtTex2"};
+    for (int i = 0; i < kHiTargets; ++i)
+    {
+        const HiTarget &t = m_hi[i];
+        const std::string idx = "[" + std::to_string(i) + "]";
+        glUniform1ui(U(("uTgtTbp" + idx).c_str()), t.fbp * 32u);
+        glUniform1ui(U(("uTgtValid" + idx).c_str()), (t.valid && t.tex) ? 1u : 0u);
+        glUniform2f(U(("uTgtScale" + idx).c_str()), t.sx, t.sy);
+        glActiveTexture(GL_TEXTURE4 + i);
+        glBindTexture(GL_TEXTURE_2D, t.tex);
+        glUniform1i(U(texNames[i]), 4 + i);
+    }
+    glBindVertexArray(m_vao);
+    const GLsizei verts = static_cast<GLsizei>(m_prims.size() / kPrimWords * 6u);
+    for (int i = 0; i < kHiTargets; ++i)
+    {
+        HiTarget &t = m_hi[i];
+        for (int role = 1; role <= 2; ++role)
+        {
+            if (!(role == 1 ? t.batchFrame : t.batchZ) || !t.valid || !t.tex)
+                continue;
+            if (role == 1 && !t.batchColor && !t.batchZImg)
+                continue; // only Z writes, and nothing in the batch tests them
+            const bool zImg = role == 1 && t.batchZImg && m_hiZTex && m_hiZW >= t.w && m_hiZH >= t.h;
+            if (zImg)
+            {
+                // The Z buffer before this batch, at the shadow's resolution (the resync program, Z layout).
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+                glUseProgram(m_hiResyncProgram);
+                glBindImageTexture(1, m_hiZTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+                glUniform1ui(glGetUniformLocation(m_hiResyncProgram, "uFbp"), t.zbp);
+                glUniform1ui(glGetUniformLocation(m_hiResyncProgram, "uFbw"), t.zfbw);
+                glUniform1ui(glGetUniformLocation(m_hiResyncProgram, "uPsm"), t.zpsm);
+                glUniform2f(glGetUniformLocation(m_hiResyncProgram, "uScale"), t.sx, t.sy);
+                const int zx0 = std::clamp(static_cast<int>(std::floor(static_cast<float>(t.batchBox[0]) * t.sx)) - 2, 0, t.w);
+                const int zy0 = std::clamp(static_cast<int>(std::floor(static_cast<float>(t.batchBox[1]) * t.sy)) - 2, 0, t.h);
+                const int zx1 = std::clamp(static_cast<int>(std::ceil(static_cast<float>(t.batchBox[2] + 1) * t.sx)) + 2, 0, t.w);
+                const int zy1 = std::clamp(static_cast<int>(std::ceil(static_cast<float>(t.batchBox[3] + 1) * t.sy)) + 2, 0, t.h);
+                glUniform4i(glGetUniformLocation(m_hiResyncProgram, "uRect"), zx0, zy0, std::max(zx1 - zx0, 0), std::max(zy1 - zy0, 0));
+                glDispatchCompute(static_cast<GLuint>((std::max(zx1 - zx0, 0) + 15) / 16), static_cast<GLuint>((std::max(zy1 - zy0, 0) + 15) / 16), 1);
+                glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+                glUseProgram(m_hiProgram);
+                glBindImageTexture(2, m_hiZTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+                Note("hires-zimage");
+            }
+            glUniform1i(U("uHiZMode"), zImg ? 1 : 0);
+            glBindImageTexture(1, t.tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+            glUniform1i(U("uHiTarget"), i);
+            glUniform1i(U("uHiRole"), role);
+            glUniform2f(U("uHiScale"), t.sx, t.sy);
+            glUniform2i(U("uHiSize"), t.w, t.h);
+            glViewport(0, 0, t.w, t.h);
+            // PS2X_GS_HIRES_TIMING=1: GPU time of the shadow passes (each query waits for the GPU: measuring only).
+            static const bool s_hiTiming = std::getenv("PS2X_GS_HIRES_TIMING") != nullptr;
+            static unsigned s_q = 0;
+            static double s_ns[2] = {0.0, 0.0};
+            static uint64_t s_n[2] = {0, 0};
+            if (s_hiTiming)
+            {
+                if (!s_q)
+                    glGenQueries(1, &s_q);
+                glBeginQuery(GL_TIME_ELAPSED, s_q);
+            }
+            glDrawArrays(GL_TRIANGLES, 0, verts);
+            if (s_hiTiming)
+            {
+                glEndQuery(GL_TIME_ELAPSED);
+                GLuint64 ns = 0;
+                glGetQueryObjectui64v(s_q, GL_QUERY_RESULT, &ns);
+                s_ns[role - 1] += static_cast<double>(ns);
+                if ((++s_n[role - 1] % 2000u) == 0u)
+                    std::fprintf(stderr, "[hires] timing: frame passes %llu %.1f ms total, z passes %llu %.1f ms total\n",
+                                 static_cast<unsigned long long>(s_n[0]), s_ns[0] * 1e-6, static_cast<unsigned long long>(s_n[1]), s_ns[1] * 1e-6);
+            }
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+            Note(role == 1 ? "hires-pass-frame" : "hires-pass-z");
+        }
+        t.batchFrame = t.batchZ = t.batchZImg = t.batchColor = false;
+    }
+    glBindImageTexture(1, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    glBindImageTexture(2, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    for (int i = 0; i < kHiTargets; ++i)
+    {
+        glActiveTexture(GL_TEXTURE4 + i);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+bool GSExactRenderer::HiResSize(uint32_t fbp, int &w, int &h)
+{
+    for (const HiTarget &t : m_hi)
+        if (m_hiOn && t.valid && t.tex && t.fbp == fbp)
+        {
+            w = t.w;
+            h = t.h;
+            return true;
+        }
+    return false;
+}
+
+bool GSExactRenderer::WriteHiResFromTexture(unsigned glTexture, int texW, int texH, const GSNativeTarget &target)
+{
+    if (!m_glReady || !m_hiOn || texW <= 0 || texH <= 0)
+        return false;
+    HiTarget *tp = nullptr;
+    for (HiTarget &t : m_hi)
+        if (t.valid && t.tex && t.fbp == target.fbp && target.fbw == 8u)
+            tp = &t;
+    if (!tp)
+        return false;
+    NoteFlush("native");
+    FlushDraws(); // drawing queued before the picture comes first
+    HiTarget &t = *tp;
+    const int dx0 = static_cast<int>(std::lround(static_cast<float>(target.x) * t.sx));
+    const int dy0 = static_cast<int>(std::lround(static_cast<float>(target.y) * t.sy));
+    const int dx1 = std::min(static_cast<int>(std::lround(static_cast<float>(target.x + target.w) * t.sx)), t.w);
+    const int dy1 = std::min(static_cast<int>(std::lround(static_cast<float>(target.y + target.h) * t.sy)), t.h);
+    if (dx0 >= dx1 || dy0 >= dy1)
+        return false;
+    glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_hiBlitFbo[0]);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, glTexture, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_hiBlitFbo[1]);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0);
+    glDisable(GL_SCISSOR_TEST);
+    const bool same = texW == dx1 - dx0 && texH == dy1 - dy0;
+    glBlitFramebuffer(0, 0, texW, texH, dx0, dy0, dx1, dy1, GL_COLOR_BUFFER_BIT, same ? GL_NEAREST : GL_LINEAR);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+    // The picture replaces what WriteFrameFromTexture just put into GS memory there (HiTouchPages marked it).
+    if (target.x <= 0 && target.y <= 0 && target.x + target.w >= static_cast<int>(t.gsW) && target.y + target.h >= static_cast<int>(t.gsH))
+        t.stale = false;
+    Note("hires-native");
+    return true;
+}
+
 void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
 {
     // draw() CPU time for PS2X_GS_GPU_STATS only (two clock reads per primitive otherwise wasted).
@@ -2951,6 +3685,13 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
                     for (uint32_t i = 0; i < tc; ++i)
                         m_cpuUse[(tf + i) % kPageCount] = true;
                 CpuRunPrim(batch, bx0, by0, bx1, by1, reinterpret_cast<uint32_t *>(m_vram));
+                if (m_hiOn)
+                {
+                    uint32_t bf, bc;
+                    pageSpan(c.frame.psm, c.frame.fbp * 32u, fbw, static_cast<uint32_t>(bx0), static_cast<uint32_t>(by0),
+                             static_cast<uint32_t>(bx1 - bx0 + 1), static_cast<uint32_t>(by1 - by0 + 1), bf, bc);
+                    HiTouchPages(bf, bc);
+                }
                 FlushPendingEpoch();
                 ++m_epochCounter;
                 for (uint32_t i = 0; i < fc; ++i)
@@ -2986,6 +3727,14 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
             const uint32_t item[12] = {0u, static_cast<uint32_t>(baseD / kPrimWords), static_cast<uint32_t>(bx0), static_cast<uint32_t>(by0),
                                        static_cast<uint32_t>(bx1 - bx0 + 1), static_cast<uint32_t>(by1 - by0 + 1), 0u, 0u, 0u, 0u, 0u, 0u};
             m_seq.insert(m_seq.end(), item, item + 12);
+            if (m_hiOn)
+            {
+                uint32_t bf, bc;
+                pageSpan(c.frame.psm, c.frame.fbp * 32u, fbw, static_cast<uint32_t>(bx0), static_cast<uint32_t>(by0),
+                         static_cast<uint32_t>(bx1 - bx0 + 1), static_cast<uint32_t>(by1 - by0 + 1), bf, bc);
+                for (int i = 0; i < kHiTargets; ++i)
+                    HiMarkStale(i, bf, bc, true);
+            }
             FlushPendingEpoch();
             ++m_epochCounter;
             for (uint32_t i = 0; i < fc; ++i)
@@ -3003,6 +3752,135 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
                     m_checkTainted[(ff + i) % kPageCount] = true; // GPU-only work: the CPU copy no longer follows
             ++m_statDeferred;
             return;
+        }
+    }
+    // High-resolution shadow roles of this primitive (see HiTarget): frame role (its frame buffer is a shadowed
+    // buffer), Z role (only its Z buffer is), or a write over a shadowed buffer's pages in another layout (that
+    // buffer is copied from GS memory after the batch). Ordering: a primitive that uses a buffer with such a copy
+    // pending, or such a write after shadow work on the buffer in this batch, starts a new batch.
+    uint32_t hiFrameMask = 0u, hiZMask = 0u, hiStaleFrame = 0u, hiStaleZ = 0u;
+    uint32_t hiPf = 0u, hiPc = 0u, hiPzf = 0u, hiPzc = 0u;
+    bool hiZOnly = false;
+    int hiBox[4] = {0, 0, -1, -1};
+    if (m_hiOn)
+    {
+        // What the primitive can write at all: ZTST NEVER writes nothing; an alpha test that always fails (ATST
+        // NEVER) writes only what AFAIL keeps; FBMSK all ones writes no colour.
+        const uint32_t ate = static_cast<uint32_t>(c.test & 1u), atst = static_cast<uint32_t>((c.test >> 1) & 7u);
+        const uint32_t afail = static_cast<uint32_t>((c.test >> 12) & 3u);
+        const bool alwaysFail = ate != 0u && atst == 0u;
+        const bool ztstNever = ((c.test >> 16) & 1u) != 0u && ztst == 0u;
+        const bool frameWrites = !ztstNever && static_cast<uint32_t>(c.frame.fbmsk) != 0xFFFFFFFFu &&
+                                 (!alwaysFail || afail == 1u || afail == 3u);
+        const bool zWrite = !ztstNever && !c.zbuf.zmask && zc != 0u && (!alwaysFail || afail == 2u);
+        // The primitive's own box (its vertices, clipped to the scissor), for writes over other buffers' pages.
+        uint32_t pf = 0, pc = 0, pzf = 0, pzc = 0;
+        int box[4] = {0, 0, -1, -1};
+        {
+            const uint32_t nv = st.prim.type == GS_PRIM_POINT ? 1u
+                                : (st.prim.type == GS_PRIM_LINE || st.prim.type == GS_PRIM_LINESTRIP || st.prim.type == GS_PRIM_SPRITE) ? 2u : 3u;
+            int bx0 = 1 << 30, by0 = 1 << 30, bx1 = -(1 << 30), by1 = -(1 << 30);
+            for (uint32_t i = 0; i < nv && i < batch.vertexCount; ++i)
+            {
+                const int x = static_cast<int>(std::lround(batch.vertices[i].x * 16.0f)) - static_cast<int>(c.xyoffset.ofx);
+                const int y = static_cast<int>(std::lround(batch.vertices[i].y * 16.0f)) - static_cast<int>(c.xyoffset.ofy);
+                bx0 = std::min(bx0, x), by0 = std::min(by0, y), bx1 = std::max(bx1, x), by1 = std::max(by1, y);
+            }
+            bx0 = std::max({(bx0 >> 4) - 1, static_cast<int>(c.scissor.x0), 0});
+            by0 = std::max({(by0 >> 4) - 1, static_cast<int>(c.scissor.y0), 0});
+            bx1 = std::min({(bx1 >> 4) + 1, static_cast<int>(c.scissor.x1), 2047});
+            by1 = std::min({(by1 >> 4) + 1, static_cast<int>(c.scissor.y1), 2047});
+            if (bx0 <= bx1 && by0 <= by1)
+            {
+                box[0] = bx0, box[1] = by0, box[2] = bx1, box[3] = by1;
+                const uint32_t bw = static_cast<uint32_t>(bx1 - bx0 + 1), bh = static_cast<uint32_t>(by1 - by0 + 1);
+                if (frameWrites)
+                    pageSpan(c.frame.psm, c.frame.fbp * 32u, fbw, static_cast<uint32_t>(bx0), static_cast<uint32_t>(by0), bw, bh, pf, pc);
+                if (zWrite)
+                    pageSpan(c.zbuf.psm, c.zbuf.zbp * 32u, fbw, static_cast<uint32_t>(bx0), static_cast<uint32_t>(by0), bw, bh, pzf, pzc);
+            }
+        }
+        hiPf = pf, hiPc = pc, hiPzf = pzf, hiPzc = pzc;
+        hiZOnly = !frameWrites;
+        std::copy(box, box + 4, hiBox);
+        bool hiFlush = false;
+        uint32_t hiUse = 0u;
+        for (int i = 0; i < kHiTargets; ++i)
+        {
+            const HiTarget &t = m_hi[i];
+            if (!t.valid)
+                continue;
+            auto overlaps = [&](uint32_t first, uint32_t count) {
+                for (uint32_t k = 0; k < count && k < kPageCount; ++k)
+                {
+                    const uint32_t pg = (first + k) % kPageCount;
+                    if (pg >= t.firstPage && pg < t.firstPage + t.pageCount)
+                        return true;
+                }
+                return false;
+            };
+            const bool frameMatch = c.frame.fbp == t.fbp && fbw == 8u && (c.frame.psm == GS_PSM_CT32 || c.frame.psm == GS_PSM_CT24);
+            const bool zAlias = frameMatch && c.zbuf.zbp == c.frame.fbp && (c.zbuf.psm == GS_PSM_Z32 || c.zbuf.psm == GS_PSM_Z24);
+            // Primitives that only write Z belong to the pass too: a later primitive of the batch may test that Z
+            // (the depth copy of that pass, uHiZMode), e.g. the port's Z clear before its depth-tested text.
+            const bool frameRole = frameMatch && (frameWrites || zWrite);
+            // Z written into a shadowed buffer by a primitive drawing elsewhere (role 2): the port paints its weapon
+            // gauges that way (sprites over the work buffer, alpha test on its alpha, "Z" = the colour, written into
+            // the display buffer).
+            const bool zRole = !frameMatch && zWrite && c.zbuf.zbp == t.fbp && (c.zbuf.psm == GS_PSM_Z32 || c.zbuf.psm == GS_PSM_Z24);
+            const bool frameStale = !frameMatch && overlaps(pf, pc);
+            const bool zStale = zWrite && !zRole && !zAlias && overlaps(pzf, pzc);
+            const bool samples = st.prim.tme && c.tex0.tbp0 == t.fbp * 32u && c.tex0.tbw == 8u &&
+                                 (c.tex0.psm == GS_PSM_CT32 || c.tex0.psm == GS_PSM_CT24);
+            if (frameRole)
+                hiFrameMask |= 1u << i;
+            if (zRole)
+                hiZMask |= 1u << i;
+            if (frameStale)
+                hiStaleFrame |= 1u << i;
+            if (zStale)
+                hiStaleZ |= 1u << i;
+            if ((frameRole || zRole || samples) && t.staleAfter)
+                hiFlush = true;
+            if (frameRole || zRole || samples)
+                hiUse |= 1u << i;
+            if ((frameStale || zStale) && (t.batchFrame || t.batchZ))
+                hiFlush = true;
+        }
+        if (hiFlush && !m_prims.empty())
+        {
+            NoteFlush("hires-order");
+            FlushDraws();
+        }
+        for (int i = 0; i < kHiTargets; ++i)
+        {
+            if ((hiUse >> i) & 1u)
+                m_hi[i].batchUse = true;
+            HiTarget &t = m_hi[i];
+            // Only a depth test needs the Z buffer's values (Z writes alone go to the copy when a later primitive
+            // of the batch tests them: its pass loads the copy, and every primitive of that pass writes into it).
+            if (((hiFrameMask >> i) & 1u) && ztst >= 2u && c.zbuf.zbp != c.frame.fbp)
+            {
+                t.batchZImg = true;
+                t.zbp = c.zbuf.zbp;
+                t.zpsm = c.zbuf.psm;
+                t.zfbw = fbw;
+            }
+        }
+        // PS2X_GS_HIRES_TRACE=<n>: the first n primitives with a shadow role or a stale write.
+        static long s_hiTrace = []() { const char *v = std::getenv("PS2X_GS_HIRES_TRACE"); return v ? std::strtol(v, nullptr, 0) : 0L; }();
+        static const long s_hiTraceFrom = []() { const char *v = std::getenv("PS2X_GS_HIRES_TRACE_FROM"); return v ? std::strtol(v, nullptr, 0) : 0L; }();
+        if (s_hiTrace > 0 && m_presentCount >= static_cast<uint64_t>(s_hiTraceFrom) && (hiFrameMask | hiZMask | hiStaleFrame | hiStaleZ) != 0u)
+        {
+            --s_hiTrace;
+            std::fprintf(stderr,
+                         "[hires] prim %u roles f%x z%x stale f%x z%x frame fbp %u fbw %u psm %u fbmsk %08x zbuf %u psm %u zmsk %u test %05x "
+                         "tme %u tbp %u tbw %u tpsm %u v0 %.1f,%.1f v1 %.1f,%.1f scissor %u,%u-%u,%u\n",
+                         static_cast<unsigned>(st.prim.type), hiFrameMask, hiZMask, hiStaleFrame, hiStaleZ, c.frame.fbp, c.frame.fbw,
+                         c.frame.psm, static_cast<unsigned>(c.frame.fbmsk), c.zbuf.zbp, c.zbuf.psm, c.zbuf.zmask ? 1u : 0u,
+                         static_cast<unsigned>(c.test), st.prim.tme ? 1u : 0u, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, batch.vertices[0].x,
+                         batch.vertices[0].y, batch.vertices[1].x, batch.vertices[1].y, c.scissor.x0, c.scissor.y0, c.scissor.x1,
+                         c.scissor.y1);
         }
     }
     bool writeConflict = false;
@@ -3063,6 +3941,29 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
     }
     p[24] = batch.vertexCount;
     p[25] = stateIndex;
+    p[27] = hiFrameMask;
+    p[28] = hiZMask;
+    p[29] = hiZOnly ? 1u : 0u;
+    if (m_hiOn)
+        for (int i = 0; i < kHiTargets; ++i)
+        {
+            HiTarget &t = m_hi[i];
+            if ((hiFrameMask >> i) & 1u)
+            {
+                if (!t.batchFrame)
+                    std::copy(hiBox, hiBox + 4, t.batchBox);
+                else
+                    t.batchBox[0] = std::min(t.batchBox[0], hiBox[0]), t.batchBox[1] = std::min(t.batchBox[1], hiBox[1]),
+                    t.batchBox[2] = std::max(t.batchBox[2], hiBox[2]), t.batchBox[3] = std::max(t.batchBox[3], hiBox[3]);
+                t.batchFrame = true;
+                t.batchColor |= !hiZOnly;
+            }
+            t.batchZ |= ((hiZMask >> i) & 1u) != 0u;
+            if ((hiStaleFrame >> i) & 1u)
+                HiMarkStale(i, hiPf, hiPc, true);
+            if ((hiStaleZ >> i) & 1u)
+                HiMarkStale(i, hiPzf, hiPzc, true);
+        }
 
     if (sameSpans && m_batchGen == genAtStart)
     {
@@ -3230,6 +4131,19 @@ void GSExactRenderer::FlushDraws()
         m_snapOps.clear();
         m_snapData.clear();
     }
+    // Shadow buffers written outside the shadow passes since (transfers, CPU work): from GS memory, before this
+    // batch draws over them.
+    if (m_hiOn && m_glReady)
+    {
+        bool anyStale = false;
+        for (const HiTarget &t : m_hi)
+            anyStale |= t.stale && t.batchUse;
+        if (anyStale)
+        {
+            UploadDirtyPages();
+            HiResyncPending(false, true);
+        }
+    }
     if ((m_prims.empty() && m_seq.empty()) || !m_glReady)
     {
         m_prims.clear();
@@ -3321,6 +4235,7 @@ void GSExactRenderer::FlushDraws()
         CheckCompare();
     if (m_mainPrims == 0u)
     {
+        HiResyncPending(true);
         m_prims.clear();
         m_states.clear();
         m_haveLastState = false;
@@ -3331,6 +4246,9 @@ void GSExactRenderer::FlushDraws()
     }
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    // The batch into the shadow buffers first: GS memory (Z buffers, textures) is then as it was before the batch.
+    if (m_hiOn)
+        HiDrawPasses();
 
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_memBuf);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_swzBuf);
@@ -3375,6 +4293,9 @@ void GSExactRenderer::FlushDraws()
     glBindVertexArray(0);
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // The same primitives into the shadow buffers, then the copies the batch's other writes need.
+    if (m_hiOn)
+        HiResyncPending(true);
     ++m_statFlushes;
 
     m_prims.clear();
@@ -3530,15 +4451,44 @@ bool GSExactRenderer::PresentFromGpu(const GSPresentationRequest &request)
     const uint32_t h = static_cast<uint32_t>(y1 - y0 + 1);
     if (w == 0u || h == 0u || w > 4096u || h > 4096u)
         return false;
-    if (w != m_canvasW || h != m_canvasH || !m_canvasTex)
+    // Shadow buffers: sized from this canvas and the window, brought up to date, and read by the circuits that
+    // show them; the canvas is then made at the window's size.
+    int hiSrc[2] = {-1, -1};
+    uint32_t cw = w, ch = h;
+    if (m_hiOn)
+    {
+        m_hiCanvasW = w;
+        m_hiCanvasH = h;
+        HiUpdateSizes();
+        for (int c = 0; c < 2; ++c)
+            if (cir[c].on && cir[c].fbw == 8u && (cir[c].psm == 0u || cir[c].psm == 1u))
+                for (int i = 0; i < kHiTargets; ++i)
+                    if (m_hi[i].valid && m_hi[i].tex && m_hi[i].fbp == cir[c].fbp)
+                    {
+                        hiSrc[c] = i;
+                        if (m_hi[i].stale)
+                        {
+                            m_hi[i].stale = false;
+                            HiResync(i, m_hi[i].staleRect);
+                        }
+                    }
+        if ((hiSrc[0] >= 0 || hiSrc[1] >= 0) && m_outW > 0 && m_outH > 0)
+        {
+            cw = static_cast<uint32_t>(std::clamp(m_outW, static_cast<int>(w), 4096));
+            ch = static_cast<uint32_t>(std::clamp(m_outH, static_cast<int>(h), 4096));
+        }
+        else
+            hiSrc[0] = hiSrc[1] = -1;
+    }
+    if (cw != m_canvasW || ch != m_canvasH || !m_canvasTex)
     {
         if (!m_canvasTex)
             glGenTextures(1, &m_canvasTex);
         glBindTexture(GL_TEXTURE_2D, m_canvasTex);
-        std::vector<uint8_t> black(static_cast<size_t>(w) * h * 4u, 0u);
+        std::vector<uint8_t> black(static_cast<size_t>(cw) * ch * 4u, 0u);
         for (size_t i = 3; i < black.size(); i += 4)
             black[i] = 255u;
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA, GL_UNSIGNED_BYTE, black.data());
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(cw), static_cast<GLsizei>(ch), 0, GL_RGBA, GL_UNSIGNED_BYTE, black.data());
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -3546,23 +4496,35 @@ bool GSExactRenderer::PresentFromGpu(const GSPresentationRequest &request)
             glGenFramebuffers(1, &m_canvasFbo);
         glBindFramebuffer(GL_FRAMEBUFFER, m_canvasFbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_canvasTex, 0);
-        m_canvasW = w;
-        m_canvasH = h;
+        m_canvasW = cw;
+        m_canvasH = ch;
     }
 
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_memBuf);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_swzBuf);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_counterBuf);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_psmBuf);
     glBindFramebuffer(GL_FRAMEBUFFER, m_canvasFbo);
-    glViewport(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+    glViewport(0, 0, static_cast<GLsizei>(cw), static_cast<GLsizei>(ch));
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
     glUseProgram(m_crtcProgram);
     auto U = [&](const char *n) { return glGetUniformLocation(m_crtcProgram, n); };
+    glUniform2f(U("uHiCanvas"), static_cast<float>(cw) / static_cast<float>(w), static_cast<float>(ch) / static_cast<float>(h));
+    for (int c = 0; c < 2; ++c)
+    {
+        const std::string idx = "[" + std::to_string(c) + "]";
+        glUniform1i(U(("uHiSrc" + idx).c_str()), hiSrc[c]);
+        const HiTarget *t = hiSrc[c] >= 0 ? &m_hi[hiSrc[c]] : nullptr;
+        glUniform2f(U(("uHiSrcScale" + idx).c_str()), t ? t->sx : 1.0f, t ? t->sy : 1.0f);
+        glActiveTexture(GL_TEXTURE2 + c);
+        glBindTexture(GL_TEXTURE_2D, t ? t->tex : 0u);
+        glUniform1i(U(c == 0 ? "uHiSrc0" : "uHiSrc1"), 2 + c);
+    }
+    glActiveTexture(GL_TEXTURE0);
     const bool interlace = (request.smode2 & 1u) != 0u;
     glUniform2i(U("uOrigin"), x0, y0);
     glUniform1i(U("uVckStep"), step);
@@ -3570,12 +4532,11 @@ bool GSExactRenderer::PresentFromGpu(const GSPresentationRequest &request)
     glUniform1i(U("uInterlace"), interlace ? 1 : 0);
     glUniform1i(U("uFfmd"), static_cast<GLint>((request.smode2 >> 1) & 1u));
     glUniform1i(U("uField"), static_cast<GLint>(request.vsyncTick & 1u)); // field parity of this vsync
-    // Display switches (like Marz). Interlace: the GS refreshes only the current field's lines, the other field
-    // keeps the previous picture (afterimages on a progressive monitor); off by default, so every line comes
-    // from the current buffer each present (the line mapping is unchanged). PS2X_GS_INTERLACE=1: as the GS.
-    static const bool s_interlace = []() { const char *v = std::getenv("PS2X_GS_INTERLACE"); return v && v[0] == '1'; }();
-    glUniform1i(U("uAllLines"), s_interlace ? 0 : 1);
-    // Anti-flicker: both read circuits show the same buffer one line apart and the merge circuit blends them
+    // Every line comes from the current buffer each present (the line mapping is unchanged), not only the current
+    // field's lines as on the GS, which leaves afterimages on a progressive monitor. The game's own DISPLAY MODE
+    // option (480i / 480p) chooses the video mode.
+    glUniform1i(U("uAllLines"), 1);
+    // Display switch (like Marz). Anti-flicker: both read circuits show the same buffer one line apart and the merge circuit blends them
     // (ALP). Off by default: circuit 1 is shown opaque. PS2X_GS_FLICKER_FILTER=1: the blend, as the GS does.
     static const bool s_flicker = []() { const char *v = std::getenv("PS2X_GS_FLICKER_FILTER"); return v && v[0] == '1'; }();
     const bool mmod = ((request.pmode >> 5) & 1u) != 0u;
@@ -3602,9 +4563,33 @@ bool GSExactRenderer::PresentFromGpu(const GSPresentationRequest &request)
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
     glUseProgram(0);
+    for (int c = 0; c < 2; ++c)
+    {
+        glActiveTexture(GL_TEXTURE2 + c);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    glActiveTexture(GL_TEXTURE0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     m_presentValid = true;
     ++m_presentCount;
+    if (m_presentHook)
+    {
+        // The top circuit: read circuit 1 where it is on (it is blended over circuit 2), else circuit 2.
+        const Circuit &top = cir[0].on ? cir[0] : cir[1];
+        GSNativePresent present;
+        present.fbp = top.fbp;
+        present.fbw = top.fbw;
+        present.canvasW = static_cast<int>(w);
+        present.canvasH = static_cast<int>(h);
+        present.originX = (top.dx - x0) / step;
+        present.originY = top.dy - y0;
+        present.dbx = top.dbx;
+        present.dby = top.dby;
+        // Unblended: both circuits show one buffer and circuit 1 is opaque, or a single circuit is on.
+        present.plain = top.psm == 0u && top.magh == step && top.magv == 1 && (opaque || (cir[0].on != cir[1].on));
+        m_presentHook(this, present);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
     DumpCanvas(request.vsyncTick);
     // PS2X_GS_EXACT_DUMP=<present number>: GS memory (after this present) and the display registers.
     static const long s_dumpAt = []()
@@ -3701,6 +4686,9 @@ void GSExactRenderer::DumpCanvas(uint64_t tick)
 
 void GSExactRenderer::DrawPresentation(float x, float y, float w, float h)
 {
+    // The window rectangle of the picture: the size the shadow buffers and the canvas are made at.
+    m_outW = static_cast<int>(std::lround(w));
+    m_outH = static_cast<int>(std::lround(h));
     if (!m_presentValid || !m_canvasTex)
         return;
     Texture2D tex{};

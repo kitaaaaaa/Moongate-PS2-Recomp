@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -39,6 +40,7 @@
 #include <vector>
 
 void ps2WaitForVif1Chain();
+extern std::function<void(float, float, float, float)> g_presentOverlay; // ps2_runtime.cpp: after the canvas is drawn
 
 namespace moon_native
 {
@@ -48,6 +50,7 @@ namespace
     constexpr uint32_t kBufferRam = 0x00332C40u;    // geo command buffer (0xC000 words)
     constexpr uint32_t kListStart = 0x00342C40u;    // word 0x4000
     constexpr uint32_t kBufferRamWords = 0xC000u;
+    constexpr uint32_t kScreenType = 0x00568520u;   // gp-0x30D0: SCREEN TYPE (0 A, 1 B, 3 C), FUN_002052d8
     constexpr uint32_t kW2Ptr = 0x0056852Cu;        // gp-0x30C4: render-state work area W2
     constexpr uint32_t kGeoState = 0x006C8300u;     // g_geo: polygon palette (1024 x RGB555) at +0
     constexpr uint32_t kColorXlat[3] = {0x006BC270u, 0x006C0270u, 0x006C4270u}; // R, G, B: 32 rows x 256 u16
@@ -189,6 +192,7 @@ namespace
 
     struct Frame
     {
+        bool hiRes = false; // also draw this frame for the high-resolution layer
         std::vector<uint32_t> geo;    // bufferRAM copy
         std::vector<uint8_t> pagesA;  // 0x80000
         std::vector<uint8_t> pagesB;  // 0x80000
@@ -639,7 +643,31 @@ namespace
                 }
                 case 0x07: g.mode = arg(0); idx += 1; break;
                 case 0x08: g.zAdjust = static_cast<int32_t>((arg(0) >> 8) << 8); idx += 1; break;
-                case 0x09: g.focus.x = u2f(arg(0)); g.focus.y = u2f(arg(1)); idx += 2; break;
+                case 0x09:
+                    g.focus.x = u2f(arg(0));
+                    g.focus.y = u2f(arg(1));
+                    idx += 2;
+                    // WIDE: the game divides its cameras' horizontal focal length by the divisor at 0x564934 (FUN_00121780;
+                    // moon_display sets it to the window's shape). The continue screen (scene 14) sets its own camera
+                    // (800 x 800) without that, so it came out 4:3 and stretched. A camera with equal focal lengths has not
+                    // been widened: divide it the same way.
+                    if (rd32(ram, 0x00564918u) != 0u && g.focus.x == g.focus.y && !envOn("PS2X_MOON_NO_WIDE_FIX"))
+                    {
+                        const float divisor = u2f(rd32(ram, 0x00564934u));
+                        if (divisor > 1.0f && divisor < 3.0f)
+                            g.focus.x /= divisor;
+                    }
+                    if (envOn("PS2X_MOON_FOCUS_TRACE"))
+                    {
+                        static float s_lx = 0.0f, s_ly = 0.0f;
+                        if (g.focus.x != s_lx || g.focus.y != s_ly)
+                        {
+                            s_lx = g.focus.x, s_ly = g.focus.y;
+                            std::fprintf(stderr, "[focus] %.4f %.4f ratio %.4f mode %u scene %u\n", g.focus.x, g.focus.y,
+                                         g.focus.x / g.focus.y, rd32(ram, 0x00513104u), rd32(ram, 0x00513108u));
+                        }
+                    }
+                    break;
                 case 0x0A: g.light = {u2f(arg(0)), u2f(arg(1)), u2f(arg(2))}; idx += 3; break;
                 case 0x0B:
                     for (int i = 0; i < 12; ++i)
@@ -1136,6 +1164,98 @@ void main()
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     }
 
+    // ---- high-resolution picture ------------------------------------------------------------------------------
+    // The GS renderer keeps a high-resolution image of the work buffer FBP 224 and the display buffers (window
+    // resolution; GSNativeSink::HiResSize): the frame's 3D and tilemap are drawn once, at that size, straight into
+    // it (WriteHiResFromTexture). GS memory gets a flat key colour with alpha 0x40 instead (the port's alpha tests
+    // need 0x40; nothing shows GS memory then). The port's own sprites, its copy to the display buffer, menus and
+    // HUD are drawn by the renderer at that resolution too. PS2X_MOON_HIRES=0: everything at the GS's 1x.
+    constexpr uint8_t kKeyR = 0x01u, kKeyG = 0x00u, kKeyB = 0x01u;
+
+    struct Hi
+    {
+        bool failed = false, ready = false;
+        GLuint fbo = 0, polyFbo = 0, polyTex = 0;
+        GLuint curTex = 0;
+        int curW = 0, curH = 0;
+        bool curDrawn = false;
+    };
+    Hi g_hi;
+
+    bool hiEnabled()
+    {
+        static const bool s_on = []() {
+            const char *v = std::getenv("PS2X_MOON_HIRES");
+            return !(v && std::strcmp(v, "0") == 0);
+        }();
+        return s_on && !g_hi.failed;
+    }
+
+    GLuint makeLinearTex(GLenum internal, int w, int h)
+    {
+        const GLuint t = makeTex(internal, w, h, internal == GL_R8 ? GL_RED : GL_RGBA, GL_UNSIGNED_BYTE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        return t;
+    }
+
+    bool ensureHi()
+    {
+        Hi &H = g_hi;
+        if (H.failed)
+            return false;
+        if (!H.ready)
+        {
+            glGenFramebuffers(1, &H.fbo);
+            glGenFramebuffers(1, &H.polyFbo);
+            H.ready = true;
+        }
+        return true;
+    }
+
+    extern "C" void rlDrawRenderBatchActive(void);
+
+    // PS2X_MOON_SHOT_EVERY=<n>: every n-th host frame the window's pixels (game window only, after the overlay) are
+    // written to window_<frame>.bmp in the working directory.
+    void windowShot()
+    {
+        static const long s_every = [] { const char *v = std::getenv("PS2X_MOON_SHOT_EVERY"); return v ? std::strtol(v, nullptr, 0) : 0L; }();
+        static const long s_from = [] { const char *v = std::getenv("PS2X_MOON_SHOT_FROM"); return v ? std::strtol(v, nullptr, 0) : 0L; }();
+        static const long s_to = [] { const char *v = std::getenv("PS2X_MOON_SHOT_TO"); return v ? std::strtol(v, nullptr, 0) : 0x7FFFFFFFL; }();
+        static long s_frame = 0;
+        if (s_every <= 0 || (++s_frame % s_every) != 0 || s_frame < s_from || s_frame > s_to)
+            return;
+        rlDrawRenderBatchActive();
+        GLint vp[4];
+        glGetIntegerv(GL_VIEWPORT, vp);
+        const int w = vp[2], h = vp[3];
+        if (w <= 0 || h <= 0)
+            return;
+        std::vector<uint8_t> px(static_cast<size_t>(w) * h * 3u + static_cast<size_t>(h) * 4u);
+        const int stride = (w * 3 + 3) & ~3;
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadBuffer(GL_BACK);
+        glReadPixels(0, 0, w, h, GL_BGR, GL_UNSIGNED_BYTE, px.data()); // bottom-up BGR rows: a BMP's own layout
+        char name[64];
+        std::snprintf(name, sizeof(name), "window_%06ld.bmp", s_frame);
+        if (envOn("PS2X_MOON_HI_TRACE"))
+            std::fprintf(stderr, "[hi] shot %ld\n", s_frame);
+        if (FILE *f = std::fopen(name, "wb"))
+        {
+            const uint32_t size = static_cast<uint32_t>(stride) * static_cast<uint32_t>(h);
+            uint8_t hd[54] = {'B', 'M'};
+            auto put = [&](int o, uint32_t v) { std::memcpy(hd + o, &v, 4); };
+            put(2, 54u + size), put(10, 54u), put(14, 40u), put(18, static_cast<uint32_t>(w)), put(22, static_cast<uint32_t>(h));
+            hd[26] = 1, hd[28] = 24;
+            put(34, size);
+            std::fwrite(hd, 1, 54, f);
+            std::fwrite(px.data(), 1, size, f);
+            std::fclose(f);
+        }
+    }
+
     // Model 2 screen (496 x 384) -> target pixels.
     constexpr float kM2W = 496.0f, kM2H = 384.0f;
 
@@ -1257,12 +1377,15 @@ void main()
             ++pi;
         }
 
-        glViewport(0, 0, W, H);
         glDisable(GL_BLEND);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
         glDisable(GL_SCISSOR_TEST);
-        glBindFramebuffer(GL_FRAMEBUFFER, G.polyFbo);
+        // One picture of w x h: the polygons into their own layer, then low tiles, that layer, high tiles.
+        auto drawPasses = [&](int w, int h, GLuint polyFbo, GLuint polyTex, GLuint outFbo) {
+        const float sx = float(w) / kM2W, sy = float(h) / kM2H;
+        glViewport(0, 0, w, h);
+        glBindFramebuffer(GL_FRAMEBUFFER, polyFbo);
         glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT);
         if (!verts.empty())
@@ -1293,14 +1416,14 @@ void main()
         }
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
         // The picture: low tiles, the polygon layer, high tiles (MAME screen_update order).
-        glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, outFbo);
         glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT);
         if (fr.haveTiles)
             tilePass(false, sx, sy);
         glUseProgram(G.copyProg);
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, G.polyTex);
+        glBindTexture(GL_TEXTURE_2D, polyTex);
         glUniform1i(G.cPoly, 1);
         glBindVertexArray(G.tileVao);
         glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1321,6 +1444,46 @@ void main()
             glClearColor(prevClear[0], prevClear[1], prevClear[2], prevClear[3]);
         }
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+        };
+        // The frame is drawn once: at the size of the renderer's high-resolution work buffer when it keeps one (GS
+        // memory gets the key colour, see "high-resolution picture"), otherwise at 496 x 384 into GS memory.
+        g_hi.curDrawn = false;
+        {
+            int hw = 0, hh = 0;
+            if (fr.hiRes && hiEnabled() && ensureHi() && sink->HiResSize(224u, hw, hh))
+            {
+                Hi &HI = g_hi;
+                if (HI.curW != hw || HI.curH != hh || !HI.curTex)
+                {
+                    if (HI.curTex)
+                        glDeleteTextures(1, &HI.curTex);
+                    HI.curTex = makeLinearTex(GL_RGBA8, hw, hh);
+                    HI.curW = hw, HI.curH = hh;
+                }
+                static int s_polyW = 0, s_polyH = 0;
+                if (s_polyW != hw || s_polyH != hh || !HI.polyTex)
+                {
+                    if (HI.polyTex)
+                        glDeleteTextures(1, &HI.polyTex);
+                    HI.polyTex = makeTex(GL_RGBA8, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE);
+                    glBindFramebuffer(GL_FRAMEBUFFER, HI.polyFbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, HI.polyTex, 0);
+                    s_polyW = hw, s_polyH = hh;
+                }
+                glBindFramebuffer(GL_FRAMEBUFFER, HI.fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, HI.curTex, 0);
+                drawPasses(hw, hh, HI.polyFbo, HI.polyTex, HI.fbo);
+                // The work buffer gets the key colour, not the picture (see the layer's comment).
+                glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
+                glViewport(0, 0, W, H);
+                glClearColor(kKeyR / 255.0f, kKeyG / 255.0f, kKeyB / 255.0f, 64.0f / 255.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+                HI.curDrawn = true;
+            }
+            else
+                drawPasses(W, H, G.polyFbo, G.polyTex, G.fbo);
+        }
         // Restore before handing over (the sink binds what it needs).
         glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
         glViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
@@ -1336,6 +1499,13 @@ void main()
         if (scis) glEnable(GL_SCISSOR_TEST);
 
         sink->WriteFrameFromTexture(G.target, fr.target);
+        // With the renderer's high-resolution work buffer: the picture goes there at its own size (GS memory got
+        // the key colour above), and the port's copy to the display buffer reads it from there.
+        if (g_hi.curDrawn)
+        {
+            sink->WriteHiResFromTexture(g_hi.curTex, g_hi.curW, g_hi.curH, fr.target);
+            g_hi.curDrawn = false;
+        }
         g_hostNs += nsSince(t0);
         glUseProgram(static_cast<GLuint>(prevProg));
         glActiveTexture(GL_TEXTURE0);
@@ -1383,12 +1553,18 @@ void main()
     // Marker ids -> frames. The marker sits in the frame's VIF1 chain where the port's Model 2 packets were
     // (chainHook); when the GS stream reaches it, the callback queues the native draw in stream order.
     std::mutex g_pendingMutex;
-    std::map<uint32_t, std::shared_ptr<Frame>> g_pending;
+    struct Pending
+    {
+        std::shared_ptr<Frame> fr;
+        int kind = 0; // 0: the frame's picture
+    };
+    std::map<uint32_t, Pending> g_pending;
     uint32_t g_nextMarker = 1;
 
     void onMarker(PS2Runtime *runtime, uint64_t value, uint32_t fbp, uint32_t fbw, uint32_t psm)
     {
         std::shared_ptr<Frame> fr;
+        int kind = 0;
         {
             std::lock_guard<std::mutex> lock(g_pendingMutex);
             if (!(value & 0x10000u))
@@ -1396,9 +1572,12 @@ void main()
             auto it = g_pending.find(static_cast<uint32_t>(value & 0xFFFFu));
             if (it == g_pending.end())
                 return;
-            fr = std::move(it->second);
+            fr = std::move(it->second.fr);
+            kind = it->second.kind;
             g_pending.erase(it);
         }
+        if (kind != 0)
+            return;
         static const bool s_trace = envOn("PS2X_MOON_NATIVE_TRACE");
         if (s_trace)
             std::fprintf(stderr, "[moon-native] marker %u reached, FRAME_1 fbp %u fbw %u psm %u\n", static_cast<uint32_t>(value), fbp,
@@ -1443,7 +1622,7 @@ void main()
             id = g_nextMarker++;
             if (g_nextMarker > 0xFFFFu) // ids travel in the 16-bit NOP immediate
                 g_nextMarker = 1u;
-            g_pending[id] = std::move(fr);
+            g_pending[id] = Pending{std::move(fr), 0};
             while (g_pending.size() > 8u) // never reached by the stream (chain dropped): forget the oldest
                 g_pending.erase(g_pending.begin());
         }
@@ -1541,6 +1720,7 @@ void main()
                 g_pendingTiles.reset();
             }
             fr->directNormalZ = rd32(rdram, 0x005671A0u);
+            fr->hiRes = true; // drawn at the renderer's high-resolution work buffer size when it keeps one
             // Geometry on the EE thread (it needs the key tables in EE RAM; cheap next to the frame).
             Builder b{*fr, rdram};
             b.run();
@@ -1692,6 +1872,7 @@ void install(PS2Runtime &runtime)
     runtime.replaceFunction(0x002093c0u, &frameHook);
     runtime.replaceFunction(0x002092d8u, &chainHook);
     runtime.replaceFunction(0x00207810u, &skipObject);
+    g_presentOverlay = [](float, float, float, float) { windowShot(); }; // PS2X_MOON_SHOT_EVERY
     g_saveOriginal = runtime.lookupFunction(0x001f8060u);
     g_restoreOriginal = runtime.lookupFunction(0x001f8118u);
     if (g_saveOriginal && g_restoreOriginal)

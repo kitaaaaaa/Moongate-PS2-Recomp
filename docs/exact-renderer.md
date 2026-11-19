@@ -152,6 +152,41 @@ low fps = dropped pictures, not slow game. The limit is the GS host/GL thread (~
 ## Display switches (exact renderer, PresentFromGpu / kCrtcFragmentBody)
 
 Both off by default (user request; afterimages): interlace -> every line from the current buffer each present
-(`uAllLines`; same line mapping), PS2X_GS_INTERLACE=1 = only the current field (as the GS). Anti-flicker -> when
+(`uAllLines`; same line mapping); the PS2X_GS_INTERLACE switch was removed (the game has its own 480i/480p option). Anti-flicker -> when
 both circuits show the same buffer with MMOD, ALP forced to 255 = circuit 1 exactly; PS2X_GS_FLICKER_FILTER=1 =
 the blend (as the GS). (The old GPU renderer's PS2X_GS_FLICKER_FILTER=0 switch is the Marz one.)
+
+## High-resolution shadow buffers (`PS2X_GS_HIRES`, on by default)
+
+Everything the window shows is drawn at the window's resolution; GS memory stays the GS's own 1x memory.
+
+- Three shadow images (`HiTarget`): the work buffer FBP 224 (496 x 384) and the display buffers FBP 0 / 0x70
+  (512 x 448), FBW 8, 32-bit. Size = the window rectangle of the picture (`DrawPresentation`) per PS2 canvas pixel,
+  so the display buffers map 1:1 to the window and FBP 224 is stretched like the TYPE-C copy (all three the same size).
+- Shadow pass (`kHiVertex`, `kDrawFragmentBody` with `#define HIRES`, `kHiFragmentMain`, `HiDrawPasses`): every
+  primitive of a batch whose frame buffer is a shadowed buffer is drawn again into its image by the same pipeline,
+  sampled at the image pixel's centre (a fractional GS position; `cxd/cyd` doubles in gsShade), before the batch's 1x
+  draw. Frame (and Z when ZBP = FBP) read/write the image (r32ui view of RGBA8) inside the interlock; a depth test
+  against another Z buffer uses a high-resolution copy of that Z buffer loaded from GS memory at pass start
+  (`m_hiZTex`); textures that are a shadowed buffer (TBP0 = its base, TBW 8, 32/24-bit) are read from its image
+  (`hiSource`/`sampleShadow`, the port's copy FBP 224 -> display buffer), other textures from GS memory.
+- Z written into a shadowed buffer by a primitive drawing elsewhere is a pass of its own (role 2): the port paints
+  its weapon gauges that way (sprites over FBP 224 with an alpha test on its alpha, "Z" = the colour, into the
+  display buffer). Primitives that only write Z are part of a frame pass only when that pass keeps a depth copy
+  (prim word 29, culled otherwise): the port clears Z before its depth-tested small text.
+- Precision: the high-resolution passes run the body with `REAL` = float (double in the 1x passes; `LF()`
+  literals), depth values stay double; triangle edges are evaluated from their lower endpoint so shared edges get
+  exactly opposite values. The 1x path is unchanged (CPU check after the change: 1,985,402 prims, 0 bad words).
+- Writes the passes do not repeat (transfers, CPU work, other layouts over those pages) mark the image stale (`HiMarkStale`, by the primitive's own box); it is
+  copied from GS memory (`kHiResyncBody`) only when next used (drawn into, read as texture, shown). The native
+  picture replaces the work buffer image entirely each frame, so those copies are rare in play.
+- PCRTC: `PresentFromGpu` makes the canvas at the window's size; a circuit whose buffer has an image reads it at the
+  fractional buffer position (`uHiCanvas`, `uHiSrc`), others read GS memory as before.
+- Native picture (moon_native.cpp): drawn once at `HiResSize(224)`, written with `WriteHiResFromTexture`; GS memory
+  gets the key colour with alpha 0x40 (the port's alpha tests need it). The old key-colour overlay is gone.
+- Switches: `PS2X_GS_HIRES=0` (renderer) / `PS2X_MOON_HIRES=0` (native picture at 1x): the previous 1x path.
+  `PS2X_GS_HIRES_TRACE=<n>` logs the first n primitives with a shadow role or stale write, `PS2X_GS_HIRES_TIMING=1`
+  GPU time of the passes (waits for the GPU), counters `hires-*` in `PS2X_GS_GPU_STATS`.
+- Measured (scripted 270 s run: menus, stage intro, match, YOU LOSE, continue, game over, attract; 1920 x 1080 and
+  1600 x 900 WIDE, RTX 2080): 600 presents per 10 s after boot; 81 presents dropped, all during boot (1x path: 61-72).
+  No copies from GS memory after boot. The first run after a shader change drops more while the driver compiles.

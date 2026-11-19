@@ -1489,6 +1489,17 @@ namespace
     }
 }
 
+// Asks the host loop to make the window's client area width x height (applied after the next presented frame).
+// From then on the window keeps that size: setDisplayAspect only changes the picture's shape inside it.
+void ps2RequestWindowSize(int width, int height)
+{
+    if (width < 160 || height < 120)
+        return;
+    g_windowSizeFixed = true;
+    g_pendingWindowHeight = height;
+    g_pendingWindowWidth = width;
+}
+
 void PS2Runtime::setDisplayAspect(float aspect)
 {
     if (!(aspect > 0.1f && aspect < 10.0f))
@@ -2990,13 +3001,51 @@ void PS2Runtime::run()
         EndDrawing();
         m_padBackend.updateGamepads();
         ++g_framesShown;
+        // Alt+Enter: borderless full screen on the current monitor, and back to the previous window.
+        if (IsKeyPressed(KEY_ENTER) && (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)))
+        {
+            static bool s_fullScreen = false;
+            static int s_width = 0, s_height = 0;
+            const int monitor = GetCurrentMonitor();
+            if (!s_fullScreen && !IsWindowState(FLAG_WINDOW_UNDECORATED))
+            {
+                s_width = GetScreenWidth(), s_height = GetScreenHeight();
+                s_fullScreen = true;
+                g_windowSizeFixed = true;
+                g_pendingWindowWidth = GetMonitorWidth(monitor), g_pendingWindowHeight = GetMonitorHeight(monitor);
+            }
+            else
+            {
+                s_fullScreen = false;
+                g_windowSizeFixed = true;
+                // Back to the size before, or to a window that fits when the game started out covering the monitor.
+                const bool known = s_width > 0 && s_width < GetMonitorWidth(monitor) && s_height < GetMonitorHeight(monitor);
+                g_pendingWindowWidth = known ? s_width : GetMonitorHeight(monitor) * 85 / 100 * 4 / 3;
+                g_pendingWindowHeight = known ? s_height : GetMonitorHeight(monitor) * 85 / 100;
+            }
+        }
         if (g_pendingWindowWidth > 0 && g_framesShown > 2)
         {
             const int monitor = GetCurrentMonitor();
-            SetWindowSize(g_pendingWindowWidth, g_pendingWindowHeight);
-            if (GetMonitorWidth(monitor) > g_pendingWindowWidth && GetMonitorHeight(monitor) > g_pendingWindowHeight)
-                SetWindowPosition((GetMonitorWidth(monitor) - g_pendingWindowWidth) / 2,
-                                  (GetMonitorHeight(monitor) - g_pendingWindowHeight) / 2);
+            const int monitorWidth = GetMonitorWidth(monitor), monitorHeight = GetMonitorHeight(monitor);
+            // A size that covers the monitor becomes a borderless window over it (the picture is scaled into it).
+            const bool covers = g_pendingWindowWidth >= monitorWidth && g_pendingWindowHeight >= monitorHeight;
+            if (covers)
+            {
+                SetWindowState(FLAG_WINDOW_UNDECORATED);
+                SetWindowSize(monitorWidth, monitorHeight);
+                const Vector2 origin = GetMonitorPosition(monitor);
+                SetWindowPosition(static_cast<int>(origin.x), static_cast<int>(origin.y));
+            }
+            else
+            {
+                if (IsWindowState(FLAG_WINDOW_UNDECORATED))
+                    ClearWindowState(FLAG_WINDOW_UNDECORATED);
+                SetWindowSize(g_pendingWindowWidth, g_pendingWindowHeight);
+                const Vector2 origin = GetMonitorPosition(monitor);
+                SetWindowPosition(static_cast<int>(origin.x) + (monitorWidth - g_pendingWindowWidth) / 2,
+                                  static_cast<int>(origin.y) + (monitorHeight - g_pendingWindowHeight) / 2);
+            }
             g_pendingWindowWidth = g_pendingWindowHeight = 0;
         }
         if (WindowShouldClose() || g_signalStop)

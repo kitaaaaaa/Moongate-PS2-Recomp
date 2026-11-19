@@ -21,6 +21,9 @@ downloads the tools again).
 
 - Saves are kept in `moon\iso_jp\mc0`.
 - The disc image is not needed after setup: the game runs from `moon\iso_jp`.
-- Display defaults: the exact GS renderer, with interlacing and the flicker filter off. The environment variables
-  `PS2X_GS_INTERLACE=1` and `PS2X_GS_FLICKER_FILTER=1` turn them back on.
+- Display: OPTIONS > DISPLAY SETTING in the game has a RESOLUTION entry for the window size (640x480 up to
+  3840x2400; a size that covers your monitor becomes a borderless full-screen window), next to the game's own
+  DISPLAY MODE (480i / 480p) and SCREEN MODE (NORMAL 4:3 / WIDE 16:9). It is kept in the system file, so save the
+  system file to keep it.
+- The flicker filter is off; the environment variable `PS2X_GS_FLICKER_FILTER=1` turns it back on.
 - The game's output goes to `moon\logs\run_play.log`; the build logs are in `moon\logs\`.

@@ -678,8 +678,8 @@ namespace
                 case 0x16: g.lod = u2f(arg(0)); idx += 1; break;
                 case 0x1B: idx += 2; break; // port op: VU1 0x136 (2 words), no Model 2 meaning used here
                 case 0x1C: ++fr.overlayOps; break; // port op: FUN_0020C1E8 (PS2 overlay), no words; not drawn yet
+                case 0x1F: idx += 1; break; // port op (0x1FA61C): passes one word through; replay lists start with it
                 case 0x0F:
-                case 0x1F:
                     return;
                 default:
                     ++fr.unknownOps; // the port's parser spins on these ('Undefined Command'); stop here

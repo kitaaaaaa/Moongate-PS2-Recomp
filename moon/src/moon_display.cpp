@@ -7,16 +7,21 @@
 // of the game's display settings record (0x18 bytes at offset 0x198 of the system file buffer), so it is saved
 // and loaded with the game's other settings; INITIALIZE zeroes the record, and 0 means the default size.
 // The picture's shape inside the window follows the game's SCREEN MODE (NORMAL 4:3, WIDE 16:9).
+// A second new row, HUD ASPECT (WIDE / 4:3), keeps the HUD and menus at 4:3 inside the WIDE picture: the native renderer
+// squeezes its HUD (moon_native.cpp) and the GS renderer the 2D drawn into the display buffers (ps2SetHiResSqueeze).
+// It is kept in byte 0x0F of the record, which the game never reads (0 = WIDE, 1 = 4:3).
 
 #include "moon_display.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
 void ps2RequestWindowSize(int width, int height); // ps2_runtime.cpp
+void ps2SetHiResSqueeze(float k);                  // gs_exact_renderer.cpp
 extern "C" int GetScreenWidth(void);  // raylib: the window's client size
 extern "C" int GetScreenHeight(void);
 extern "C" bool IsWindowReady(void);
@@ -34,10 +39,14 @@ namespace
     constexpr uint32_t kWideFlag = 0x00564918u;        // SCREEN MODE: 0 NORMAL, 1 WIDE
     constexpr uint32_t kRecordOffset = 0x198u, kRecordResolution = 0x14u; // spare byte: 0 default, else index + 1
     constexpr uint32_t kRecordWide = 0x11u;                              // SCREEN MODE in the record
-    constexpr uint32_t kNewRow = 5u; // before INITIALIZE and EXIT
+    constexpr uint32_t kRecordHud = 0x0Fu;                               // HUD ASPECT: 0 WIDE, 1 4:3 (unused by the game)
+    constexpr uint32_t kNewRow = 5u; // RESOLUTION, before INITIALIZE and EXIT
+    constexpr uint32_t kHudRow = 6u; // HUD ASPECT, after it
+    constexpr uint32_t kNewRows = 2u;
     // Guest memory for the new table and strings: the runtime's MPEG audio scratch (0xF0000..0x100000, MPEG.cpp),
     // used only by movie playback; this game has no movies.
     constexpr uint32_t kTable = 0x000F8000u, kStringPtrs = 0x000F8200u, kStrings = 0x000F8300u, kLabel = 0x000F82C0u;
+    constexpr uint32_t kHudLabel = 0x000F82D0u, kHudPtrs = 0x000F82E0u, kHudStrings = 0x000F8600u;
 
     struct Size
     {
@@ -55,6 +64,8 @@ namespace
     int g_appliedIndex = -1;
     bool g_loaded = false; // the system file (or its defaults) has set the game's flags
     int g_appliedWide = -1;
+    bool g_hud43 = false;                  // HUD ASPECT 4:3
+    std::atomic<float> g_hudSqueeze{1.0f}; // read by the native renderer
 
     uint32_t rd32(const uint8_t *rdram, uint32_t a)
     {
@@ -106,6 +117,13 @@ namespace
             }
         }
         g_appliedWide = wideMode ? 1 : 0;
+        // HUD ASPECT 4:3: 2D placed for the 4:3 screen is drawn at 4:3 in the middle of the wide picture.
+        const float squeeze = (wideMode && g_hud43) ? (4.0f / 3.0f) / aspect : 1.0f;
+        if (squeeze != g_hudSqueeze.load())
+        {
+            g_hudSqueeze.store(squeeze);
+            ps2SetHiResSqueeze(squeeze);
+        }
         if (aspect == g_appliedAspect)
             return;
         g_appliedAspect = aspect;
@@ -129,10 +147,25 @@ namespace
 
     // getter(menu, idx): stores the current choice index at menu + 0x2C + idx*4. Runs when the menu opens and on
     // every refresh (after INITIALIZE too), so it also applies a value that changed under it.
-    void resolutionGetter(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    // getter for the HUD ASPECT row, which shares the RESOLUTION row's handlers (they get the row index).
+    void hudGetter(uint8_t *rdram, uint32_t menu, uint32_t idx)
+    {
+        const uint32_t record = recordOf(rdram, menu);
+        const uint32_t value = (record && rdram[(record + kRecordHud) & 0x01FFFFFFu] == 1u) ? 1u : 0u;
+        wr32(rdram, menu + 0x2Cu + idx * 4u, value);
+        g_hud43 = value == 1u;
+    }
+
+    void resolutionGetter(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         ctx->pc = GPR_U32(ctx, 31);
         const uint32_t menu = GPR_U32(ctx, 4), idx = GPR_U32(ctx, 5);
+        if (idx == kHudRow)
+        {
+            hudGetter(rdram, menu, idx);
+            applyAspect(rdram, runtime, rd32(rdram, kWideFlag) != 0u);
+            return;
+        }
         const uint32_t record = recordOf(rdram, menu);
         const uint32_t index = record ? indexFromStored(rdram[(record + kRecordResolution) & 0x01FFFFFFu]) : kDefaultIndex;
         wr32(rdram, menu + 0x2Cu + idx * 4u, index);
@@ -140,10 +173,18 @@ namespace
     }
 
     // change(menu, idx, value): value = the new choice index (the entry has no value map).
-    void resolutionChange(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    void resolutionChange(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         ctx->pc = GPR_U32(ctx, 31);
         const uint32_t menu = GPR_U32(ctx, 4);
+        if (GPR_U32(ctx, 5) == kHudRow)
+        {
+            g_hud43 = GPR_U32(ctx, 6) == 1u;
+            if (const uint32_t record = recordOf(rdram, menu))
+                rdram[(record + kRecordHud) & 0x01FFFFFFu] = g_hud43 ? 1u : 0u;
+            applyAspect(rdram, runtime, rd32(rdram, kWideFlag) != 0u);
+            return;
+        }
         uint32_t index = GPR_U32(ctx, 6);
         if (index >= kSizeCount)
             index = kDefaultIndex;
@@ -159,9 +200,9 @@ namespace
 
     void buildTable(uint8_t *rdram)
     {
-        // Rows 0..4 as the game has them, the new row, then INITIALIZE and EXIT.
+        // Rows 0..4 as the game has them, the new rows, then INITIALIZE and EXIT.
         std::memcpy(rdram + kTable, rdram + kGameTable, kNewRow * kEntrySize);
-        std::memcpy(rdram + kTable + (kNewRow + 1u) * kEntrySize, rdram + kGameTable + kNewRow * kEntrySize,
+        std::memcpy(rdram + kTable + (kNewRow + kNewRows) * kEntrySize, rdram + kGameTable + kNewRow * kEntrySize,
                     (kGameEntries - kNewRow) * kEntrySize);
         writeString(rdram, kLabel, "RESOLUTION");
         for (uint32_t i = 0; i < kSizeCount; ++i)
@@ -180,6 +221,21 @@ namespace
         wr32(rdram, e + 0x14u, kChangeAddr); // change
         wr32(rdram, e + 0x18u, kSizeCount);
         wr32(rdram, e + 0x1Cu, kStringPtrs);
+
+        writeString(rdram, kHudLabel, "HUD ASPECT");
+        writeString(rdram, kHudStrings, "WIDE");
+        writeString(rdram, kHudStrings + 16u, "4:3");
+        wr32(rdram, kHudPtrs, kHudStrings);
+        wr32(rdram, kHudPtrs + 4u, kHudStrings + 16u);
+        const uint32_t h = kTable + kHudRow * kEntrySize;
+        std::memset(rdram + h, 0, kEntrySize);
+        wr32(rdram, h + 0x00u, kHudLabel);
+        wr32(rdram, h + 0x04u, 9u);          // id
+        wr32(rdram, h + 0x08u, 3u);          // left/right value row
+        wr32(rdram, h + 0x0Cu, kGetterAddr); // getter
+        wr32(rdram, h + 0x14u, kChangeAddr); // change
+        wr32(rdram, h + 0x18u, 2u);
+        wr32(rdram, h + 0x1Cu, kHudPtrs);
     }
 
     // FUN_001114d8(a0 obj, a1 parent, a2 owner, a3 table, t0 count, t1 line height, t2 label width)
@@ -189,7 +245,7 @@ namespace
         {
             buildTable(rdram);
             SET_GPR_U32(ctx, 7, kTable);
-            SET_GPR_U32(ctx, 8, kGameEntries + 1u);
+            SET_GPR_U32(ctx, 8, kGameEntries + kNewRows);
         }
         g_createOriginal(rdram, ctx, runtime);
     }
@@ -232,12 +288,18 @@ namespace
         const uint8_t stored = buffer ? rdram[(buffer + kRecordOffset + kRecordResolution) & 0x01FFFFFFu] : 0u;
         // The record's SCREEN MODE byte: the game's flag 0x564918 is only set from it later.
         const bool wide = buffer && rdram[(buffer + kRecordOffset + kRecordWide) & 0x01FFFFFFu] != 0u;
+        g_hud43 = buffer && rdram[(buffer + kRecordOffset + kRecordHud) & 0x01FFFFFFu] == 1u;
         g_loadOriginal(rdram, ctx, runtime);
         if (stored != 0u)
             applyResolution(indexFromStored(stored));
         applyAspect(rdram, runtime, wide);
         g_loaded = true;
     }
+}
+
+float hudSqueeze()
+{
+    return g_hudSqueeze.load();
 }
 
 void install(PS2Runtime &runtime)

@@ -20,6 +20,14 @@
 #include <chrono>
 #include <thread>
 
+// Horizontal squeeze of the 2D drawn into the display buffers' shadow images (1 = none): set by a game module, e.g. to
+// keep menus at 4:3 inside a widescreen picture. Only the high-resolution shadow images change; GS memory does not.
+static std::atomic<float> g_hiResSqueeze{1.0f};
+void ps2SetHiResSqueeze(float k)
+{
+    g_hiResSqueeze.store(k > 0.0f && k <= 1.0f ? k : 1.0f, std::memory_order_relaxed);
+}
+
 namespace
 {
     // GS memory, swizzle tables and per-PSM layout constants, shared by the draw and PCRTC shaders.
@@ -962,7 +970,9 @@ uniform int uHiTarget, uHiRole;
 uniform vec2 uHiScale;
 uniform ivec2 uHiSize;
 uniform int uHiZMode; // 0: primitives that only write Z (prim word 29) have nothing to do in this pass
+uniform float uHiSqueeze, uHiCenter; // prim word 30 set: drawn squeezed horizontally by uHiSqueeze about uHiCenter
 flat out int vPrim;
+flat out int vSq;
 
 int wcoord(uint pk, int shiftBits, uint offset)
 {
@@ -975,6 +985,7 @@ void main()
     int corner = gl_VertexID % 6;
     vPrim = prim;
     uint pb = uint(prim) * 32u;
+    vSq = int(prims[pb + 30u]);
     uint roles = prims[pb + (uHiRole == 1 ? 27u : 28u)];
     if (prims[pb + 26u] != 0u || ((roles >> uint(uHiTarget)) & 1u) == 0u || (uHiZMode == 0 && prims[pb + 29u] != 0u))
     {
@@ -1005,8 +1016,14 @@ void main()
         return;
     }
     // GS pixels x0..x1 cover GS positions [x0 - 0.5, x1 + 0.5); shadow pixel X samples (X + 0.5) / scale - 0.5.
-    int hx0 = max(int(floor(float(x0) * uHiScale.x)) - 1, 0), hy0 = max(int(floor(float(y0) * uHiScale.y)) - 1, 0);
-    int hx1 = min(int(ceil(float(x1 + 1) * uHiScale.x)) + 1, uHiSize.x), hy1 = min(int(ceil(float(y1 + 1) * uHiScale.y)) + 1, uHiSize.y);
+    float fx0 = float(x0), fx1 = float(x1 + 1);
+    if (vSq != 0)
+    {
+        fx0 = uHiCenter + (fx0 - 0.5 - uHiCenter) * uHiSqueeze + 0.5;
+        fx1 = uHiCenter + (fx1 - 0.5 - uHiCenter) * uHiSqueeze + 0.5;
+    }
+    int hx0 = max(int(floor(fx0 * uHiScale.x)) - 1, 0), hy0 = max(int(floor(float(y0) * uHiScale.y)) - 1, 0);
+    int hx1 = min(int(ceil(fx1 * uHiScale.x)) + 1, uHiSize.x), hy1 = min(int(ceil(float(y1 + 1) * uHiScale.y)) + 1, uHiSize.y);
     if (hx0 >= hx1 || hy0 >= hy1)
     {
         gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
@@ -1020,11 +1037,17 @@ void main()
 
     const char *kHiFragmentMain = R"GLSL(
 flat in int vPrim;
+flat in int vSq;
+uniform float uHiSqueeze, uHiCenter;
 void main()
 {
     gHiPix = ivec2(gl_FragCoord.xy);
-    // GS position of this shadow pixel's centre, in 1/16 pixels, and the GS pixel whose square holds it.
-    gHiC = (gl_FragCoord.xy / uHiScale - 0.5) * 16.0;
+    // GS position of this shadow pixel's centre, in 1/16 pixels, and the GS pixel whose square holds it. A squeezed
+    // primitive (vSq) is drawn as at 1x, then pulled towards the centre: its GS position is the inverse of that.
+    vec2 g = gl_FragCoord.xy / uHiScale - 0.5;
+    if (vSq != 0)
+        g.x = uHiCenter + (g.x - uHiCenter) / uHiSqueeze;
+    gHiC = g * 16.0;
     ivec2 gp = ivec2(floor((gHiC + 8.0) / 16.0));
     if (!gsShade(vPrim, gp))
         discard;
@@ -3376,7 +3399,7 @@ void GSExactRenderer::HiDrawPasses()
     struct Loc
     {
         unsigned prog = 0;
-        GLint debug, zMode, target, role, scale, size, tbp[kHiTargets], valid[kHiTargets], tscale[kHiTargets], tex[kHiTargets];
+        GLint debug, zMode, target, role, scale, size, squeeze, center, tbp[kHiTargets], valid[kHiTargets], tscale[kHiTargets], tex[kHiTargets];
         uint32_t lastTbp[kHiTargets], lastValid[kHiTargets];
         float lastSx[kHiTargets], lastSy[kHiTargets];
     };
@@ -3386,7 +3409,7 @@ void GSExactRenderer::HiDrawPasses()
         L.prog = m_hiProgram;
         auto G = [&](const std::string &n) { return glGetUniformLocation(m_hiProgram, n.c_str()); };
         L.debug = G("uDebug"), L.zMode = G("uHiZMode"), L.target = G("uHiTarget"), L.role = G("uHiRole");
-        L.scale = G("uHiScale"), L.size = G("uHiSize");
+        L.scale = G("uHiScale"), L.size = G("uHiSize"), L.squeeze = G("uHiSqueeze"), L.center = G("uHiCenter");
         for (int i = 0; i < kHiTargets; ++i)
         {
             const std::string idx = "[" + std::to_string(i) + "]";
@@ -3453,6 +3476,8 @@ void GSExactRenderer::HiDrawPasses()
             glUniform1i(L.role, role);
             glUniform2f(L.scale, t.sx, t.sy);
             glUniform2i(L.size, t.w, t.h);
+            glUniform1f(L.squeeze, std::max(g_hiResSqueeze.load(std::memory_order_relaxed), 0.25f));
+            glUniform1f(L.center, static_cast<float>(t.gsW) * 0.5f - 0.5f);
             glViewport(0, 0, t.w, t.h);
             // PS2X_GS_HIRES_TIMING=1: GPU time of the shadow passes (each query waits for the GPU: measuring only).
             static const bool s_hiTiming = std::getenv("PS2X_GS_HIRES_TIMING") != nullptr;
@@ -3808,6 +3833,9 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
     uint32_t hiPf = 0u, hiPc = 0u, hiPzf = 0u, hiPzc = 0u;
     bool hiZOnly = false;
     int hiBox[4] = {0, 0, -1, -1};
+    // ps2SetHiResSqueeze: primitives into the display buffers that are not full width (clears, fades, backgrounds)
+    // and not the copy of the work buffer (FBP 224) are drawn squeezed towards the centre in the shadow images.
+    bool squeezeBox = false, hiSqueeze = false;
     if (m_hiOn)
     {
         // What the primitive can write at all: ZTST NEVER writes nothing; an alpha test that always fails (ATST
@@ -3849,6 +3877,8 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
         hiPf = pf, hiPc = pc, hiPzf = pzf, hiPzc = pzc;
         hiZOnly = !frameWrites;
         std::copy(box, box + 4, hiBox);
+        squeezeBox = box[0] <= box[2] && (box[2] - box[0] + 1) * 10 < (static_cast<int>(c.scissor.x1) - static_cast<int>(c.scissor.x0) + 1) * 9 &&
+                     !(st.prim.tme && c.tex0.tbp0 == 224u * 32u);
         bool hiFlush = false;
         uint32_t hiUse = 0u;
         for (int i = 0; i < kHiTargets; ++i)
@@ -3893,6 +3923,21 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
             if ((frameStale || zStale) && (t.batchFrame || t.batchZ))
                 hiFlush = true;
         }
+        const float squeeze = g_hiResSqueeze.load(std::memory_order_relaxed);
+        if (squeeze < 0.999f && squeezeBox)
+            for (int i = 0; i < kHiTargets; ++i)
+            {
+                const HiTarget &t = m_hi[i];
+                if (!t.valid || t.gsW != 512u || ((hiFrameMask >> i) & 1u) == 0u)
+                    continue;
+                hiSqueeze = true;
+                // The batch box (depth copy) covers both the 1x box and where the primitive lands.
+                const float cx = static_cast<float>(t.gsW) * 0.5f - 0.5f;
+                const int sx0 = static_cast<int>(std::floor(cx + (static_cast<float>(box[0]) - 0.5f - cx) * squeeze)) - 1;
+                const int sx1 = static_cast<int>(std::ceil(cx + (static_cast<float>(box[2]) + 0.5f - cx) * squeeze)) + 1;
+                hiBox[0] = std::max(std::min(hiBox[0], sx0), 0);
+                hiBox[2] = std::max(hiBox[2], sx1);
+            }
         if (hiFlush && !m_prims.empty())
         {
             NoteFlush("hires-order");
@@ -3992,6 +4037,7 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
     p[27] = hiFrameMask;
     p[28] = hiZMask;
     p[29] = hiZOnly ? 1u : 0u;
+    p[30] = hiSqueeze ? 1u : 0u;
     if (m_hiOn)
         for (int i = 0; i < kHiTargets; ++i)
         {

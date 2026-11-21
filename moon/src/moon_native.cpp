@@ -15,6 +15,7 @@
 // overlay hooks inside FUN_002093c0 (FUN_0020bc10, render-list ops 0xF/0x1C/0x1D/0x1E).
 
 #include "moon_native.h"
+#include "moon_display.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -188,11 +189,13 @@ namespace
         int viewport[4]{};
         int center[2]{};
         uint32_t order = 0;
+        bool hud = false; // screen-anchored 2D (HUD ASPECT 4:3 squeezes it)
     };
 
     struct Frame
     {
         bool hiRes = false; // also draw this frame for the high-resolution layer
+        float hudSqueeze = 1.0f; // moon_display::hudSqueeze(): HUD polygons and tile layer 0 squeezed towards the centre
         std::vector<uint32_t> geo;    // bufferRAM copy
         std::vector<uint8_t> pagesA;  // 0x80000
         std::vector<uint8_t> pagesB;  // 0x80000
@@ -401,8 +404,13 @@ namespace
                 ++fr.skippedObjects; // polygon RAM (op 5 data): not used by the port's lists seen so far
                 return;
             }
+            // The enemy-direction arrow at the screen's edge: drawn in front of the camera, not at z 1 like the
+            // rest of the HUD, with its x scaled by the WIDE ratio like the HUD.
+            objectHud = (pa & 0x3FFFFFu) == (0x008F31A0u & 0x3FFFFFu);
             objectData(tp, th, g_roms.pdt, pa & 0x3FFFFFu, pn, typeWord, centerSel);
+            objectHud = false;
         }
+        bool objectHud = false;
 
         // The port's op 2 (FUN_001f9c58 case 2): TP, TH, 6 words (two points), then records of 9 words
         // {attr, luma, distance, point, point} until attr 0. It turns them into object data {attr, normal
@@ -563,6 +571,8 @@ namespace
                         P.center[0] = g.center[centerSel][0];
                         P.center[1] = g.center[centerSel][1];
                         P.order = order++;
+                        // HUD pieces lie in the plane z = 1 of the camera (bars, frames, weapon boxes, markers).
+                        P.hud = objectHud || (minz == 1.0f && maxz == 1.0f);
                         fr.polys.push_back(P);
                     }
                 }
@@ -859,6 +869,7 @@ layout(std430, binding = 4) readonly buffer Tiles { uint tw[]; };
 uniform usampler2D uSheet, uTilePal, uXlat;
 uniform vec2 uScale;
 uniform bool uHigh, uGamma;
+uniform float uSqueeze; // layer 0 (HUD and menu text) squeezed towards the centre by this factor
 const uint NONE = 0xffffffffu;
 uint rd16(int i)
 {
@@ -927,15 +938,19 @@ void main()
     ivec2 p = ivec2(gl_FragCoord.xy / uScale);
     if (p.x >= 496 || p.y >= 384)
         discard;
+    int x0 = int(floor(248.0 + (gl_FragCoord.x / uScale.x - 248.0) / uSqueeze)); // layer 0's x
+    bool in0 = x0 >= 0 && x0 < 496;
     uint v = 0u;
     if (!uHigh)
     {
         for (int L = 3; L >= 2; --L) { uint r = layerPixel(L, p.x, p.y, 0u, true); if (r != NONE) v = r; }
-        for (int L = 1; L >= 0; --L) { uint r = layerPixel(L, p.x, p.y, 0u, false); if (r != NONE) v = r; }
+        { uint r = layerPixel(1, p.x, p.y, 0u, false); if (r != NONE) v = r; }
+        if (in0) { uint r = layerPixel(0, x0, p.y, 0u, false); if (r != NONE) v = r; }
     }
     else
     {
-        for (int L = 3; L >= 0; --L) { uint r = layerPixel(L, p.x, p.y, 1u, false); if (r != NONE) v = r; }
+        for (int L = 3; L >= 1; --L) { uint r = layerPixel(L, p.x, p.y, 1u, false); if (r != NONE) v = r; }
+        if (in0) { uint r = layerPixel(0, x0, p.y, 1u, false); if (r != NONE) v = r; }
         if (v == 0u)
             discard;
     }
@@ -950,7 +965,7 @@ void main()
     struct Gl
     {
         GLuint tileProg = 0, tileVao = 0, tileBuf = 0, sheet = 0, tilePal = 0;
-        GLint tSheet = -1, tPal = -1, tXlat = -1, tScale = -1, tHigh = -1, tGamma = -1;
+        GLint tSheet = -1, tPal = -1, tXlat = -1, tScale = -1, tHigh = -1, tGamma = -1, tSqueeze = -1;
         std::vector<uint8_t> linSheet;
         bool ready = false, failed = false;
         GLuint prog = 0, vao = 0, vbo = 0, polyBuf = 0, fbo = 0, target = 0;
@@ -1054,6 +1069,7 @@ void main()
                 G.tScale = glGetUniformLocation(G.tileProg, "uScale");
                 G.tHigh = glGetUniformLocation(G.tileProg, "uHigh");
                 G.tGamma = glGetUniformLocation(G.tileProg, "uGamma");
+                G.tSqueeze = glGetUniformLocation(G.tileProg, "uSqueeze");
                 glGenVertexArrays(1, &G.tileVao);
                 glGenBuffers(1, &G.tileBuf);
             }
@@ -1131,7 +1147,7 @@ void main()
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, format, type, data);
     }
 
-    void tilePass(bool high, float sx, float sy)
+    void tilePass(bool high, float sx, float sy, float squeeze)
     {
         Gl &G = g_gl;
         glUseProgram(G.tileProg);
@@ -1146,6 +1162,7 @@ void main()
         }
         glUniform2f(G.tScale, sx, sy);
         glUniform1i(G.tHigh, high ? 1 : 0);
+        glUniform1f(G.tSqueeze, squeeze);
         static const bool s_gamma = envOn("PS2X_MOON_GAMMA");
         glUniform1i(G.tGamma, s_gamma ? 1 : 0);
         glBindVertexArray(G.tileVao);
@@ -1365,7 +1382,9 @@ void main()
             for (int j = 0; j < P.n; ++j)
             {
                 const float z = P.z[j] + 1.17549435e-38f;
-                const float px = float(P.center[0] - ox) + P.x[j] / z;          // Model 2 screen x
+                float px = float(P.center[0] - ox) + P.x[j] / z;                // Model 2 screen x
+                if (P.hud)
+                    px = kM2W * 0.5f + (px - kM2W * 0.5f) * fr.hudSqueeze;
                 const float py = (384.0f - float(P.center[1]) - float(oy)) - P.y[j] / z; // Model 2 screen y (0 = top)
                 cw[j] = std::max(P.z[j], 1e-6f);
                 cx[j] = (px * sx / float(W) * 2.0f - 1.0f) * cw[j];
@@ -1420,7 +1439,7 @@ void main()
         glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT);
         if (fr.haveTiles)
-            tilePass(false, sx, sy);
+            tilePass(false, sx, sy, fr.hudSqueeze);
         glUseProgram(G.copyProg);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, polyTex);
@@ -1429,7 +1448,7 @@ void main()
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glBindTexture(GL_TEXTURE_2D, 0);
         if (fr.haveTiles)
-            tilePass(true, sx, sy);
+            tilePass(true, sx, sy, fr.hudSqueeze);
         // Alpha 0x40 on every pixel, as the port's own pictures have: before its composite the port draws sprites
         // over FBP 224 that use FBP 224 as their Z buffer with alpha test NOTEQUAL 0x40 (TEST 0x3040f), zeroing
         // every pixel whose alpha is not 0x40.
@@ -1721,6 +1740,7 @@ void main()
             }
             fr->directNormalZ = rd32(rdram, 0x005671A0u);
             fr->hiRes = true; // drawn at the renderer's high-resolution work buffer size when it keeps one
+            fr->hudSqueeze = moon_display::hudSqueeze();
             // Geometry on the EE thread (it needs the key tables in EE RAM; cheap next to the frame).
             Builder b{*fr, rdram};
             b.run();

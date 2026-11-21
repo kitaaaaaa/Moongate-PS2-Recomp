@@ -3,6 +3,7 @@
 #include "ps2_host_backend.h"
 #include "ps2x/iop/iop_audio.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -82,6 +83,16 @@ namespace
     }
 }
 
+// Optional host-side mixer, called on every block of SPU2 output (48 kHz stereo s16, interleaved) before it is
+// recorded or played, in emulated time on the IOP thread. Game modules use it to mix in audio the runtime does not
+// emulate (moon_music.cpp: the music from the user's CD rips). Declared where it is used.
+using Ps2AudioMixHook = void (*)(int16_t *frames, size_t frameCount);
+static std::atomic<Ps2AudioMixHook> g_audioMixHook{nullptr};
+void ps2SetAudioMixHook(Ps2AudioMixHook hook)
+{
+    g_audioMixHook.store(hook);
+}
+
 namespace
 {
     // Host side of the emulated SPU2 (ps2xIOP): frames arrive from the IOP
@@ -104,6 +115,13 @@ namespace
 
         void push(const int16_t *frames, size_t frameCount)
         {
+            if (Ps2AudioMixHook hook = g_audioMixHook.load())
+            {
+                thread_local std::vector<int16_t> mixed;
+                mixed.assign(frames, frames + frameCount * 2u);
+                hook(mixed.data(), frameCount);
+                frames = mixed.data();
+            }
             writeDump(frames, frameCount);
             ensureStream();
             if (!m_streamReady)

@@ -1017,7 +1017,7 @@ void main()
     }
     // GS pixels x0..x1 cover GS positions [x0 - 0.5, x1 + 0.5); shadow pixel X samples (X + 0.5) / scale - 0.5.
     float fx0 = float(x0), fx1 = float(x1 + 1);
-    if (vSq != 0)
+    if ((vSq & 1) != 0)
     {
         fx0 = uHiCenter + (fx0 - 0.5 - uHiCenter) * uHiSqueeze + 0.5;
         fx1 = uHiCenter + (fx1 - 0.5 - uHiCenter) * uHiSqueeze + 0.5;
@@ -1045,10 +1045,14 @@ void main()
     // GS position of this shadow pixel's centre, in 1/16 pixels, and the GS pixel whose square holds it. A squeezed
     // primitive (vSq) is drawn as at 1x, then pulled towards the centre: its GS position is the inverse of that.
     vec2 g = gl_FragCoord.xy / uHiScale - 0.5;
-    if (vSq != 0)
+    if ((vSq & 1) != 0)
         g.x = uHiCenter + (g.x - uHiCenter) / uHiSqueeze;
     gHiC = g * 16.0;
     ivec2 gp = ivec2(floor((gHiC + 8.0) / 16.0));
+    // vSq bit 1: a flat full-height fill (the pause menu's dim, drawn in 64-pixel strips) covers what it covers at 1x,
+    // so the strips leave no gaps between them at this resolution.
+    if ((vSq & 2) != 0)
+        gHiC = vec2(gp) * 16.0;
     if (!gsShade(vPrim, gp))
         discard;
     beginInvocationInterlockARB();
@@ -3835,7 +3839,7 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
     int hiBox[4] = {0, 0, -1, -1};
     // ps2SetHiResSqueeze: primitives into the display buffers that are not full width (clears, fades, backgrounds)
     // and not the copy of the work buffer (FBP 224) are drawn squeezed towards the centre in the shadow images.
-    bool squeezeBox = false, hiSqueeze = false;
+    bool squeezeBox = false, hiSqueeze = false, hiSnap = false;
     if (m_hiOn)
     {
         // What the primitive can write at all: ZTST NEVER writes nothing; an alpha test that always fails (ATST
@@ -3862,7 +3866,16 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
             }
             bx0 = std::max({(bx0 >> 4) - 1, static_cast<int>(c.scissor.x0), 0});
             by0 = std::max({(by0 >> 4) - 1, static_cast<int>(c.scissor.y0), 0});
-            bx1 = std::min({(bx1 >> 4) + 1, static_cast<int>(c.scissor.x1), 2047});
+            // The one-pixel margin stops at the buffer's width when the primitive itself ends inside it: past it the
+            // margin lands on the first page of the next rows (the buffer below), and the pause menu's full-screen dim
+            // (x 0..511.9 into a display buffer) then marked the other display buffer and the work buffer stale every
+            // frame. PS2X_GS_HIRES_BOX_MARGIN_WRAP=1: the old box.
+            static const bool s_marginWrap = std::getenv("PS2X_GS_HIRES_BOX_MARGIN_WRAP") != nullptr;
+            const int bufW = static_cast<int>(fbw) * 64;
+            const int rawX1 = bx1 >> 4;
+            bx1 = std::min({rawX1 + 1, static_cast<int>(c.scissor.x1), 2047});
+            if (!s_marginWrap && bufW > 0 && rawX1 < bufW)
+                bx1 = std::min(bx1, bufW - 1);
             by1 = std::min({(by1 >> 4) + 1, static_cast<int>(c.scissor.y1), 2047});
             if (bx0 <= bx1 && by0 <= by1)
             {
@@ -3877,8 +3890,18 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
         hiPf = pf, hiPc = pc, hiPzf = pzf, hiPzc = pzc;
         hiZOnly = !frameWrites;
         std::copy(box, box + 4, hiBox);
+        // Not what touches the screen's left or right edge: the game's black border strips there stay at the edges.
         squeezeBox = box[0] <= box[2] && (box[2] - box[0] + 1) * 10 < (static_cast<int>(c.scissor.x1) - static_cast<int>(c.scissor.x0) + 1) * 9 &&
+                     box[0] > static_cast<int>(c.scissor.x0) + 2 && box[2] < static_cast<int>(c.scissor.x1) - 2 &&
                      !(st.prim.tme && c.tex0.tbp0 == 224u * 32u);
+        // An untextured fill over the buffer's whole width (the pause menu's dim, scissor 640 wide) is full width, and so
+        // is one at least 380 lines tall (a fill drawn in strips): HUD and menu pieces are never that tall.
+        if (!st.prim.tme && ((box[0] <= 0 && box[2] >= static_cast<int>(fbw) * 64 - 1) || box[3] - box[1] + 1 >= 380))
+            squeezeBox = false;
+        // A flat untextured fill that tall is drawn in the shadow images with its 1x coverage (no seams between strips).
+        // PS2X_GS_HIRES_NO_FILL_SNAP=1: sampled at the shadow resolution like everything else.
+        static const bool s_noFillSnap = std::getenv("PS2X_GS_HIRES_NO_FILL_SNAP") != nullptr;
+        hiSnap = !s_noFillSnap && !st.prim.tme && !st.prim.iip && box[3] - box[1] + 1 >= 380;
         bool hiFlush = false;
         uint32_t hiUse = 0u;
         for (int i = 0; i < kHiTargets; ++i)
@@ -3938,6 +3961,21 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
                 hiBox[0] = std::max(std::min(hiBox[0], sx0), 0);
                 hiBox[2] = std::max(hiBox[2], sx1);
             }
+        // PS2X_GS_HIRES_TRACE_WIDE=<n>: the first n squeezed primitives at least 480 pixels wide or 300 lines tall.
+        static long s_wideTrace = []() { const char *v = std::getenv("PS2X_GS_HIRES_TRACE_WIDE"); return v ? std::strtol(v, nullptr, 0) : 0L; }();
+        if (s_wideTrace > 0 && hiSqueeze && (box[2] - box[0] + 1 >= 480 || box[3] - box[1] + 1 >= 300))
+        {
+            --s_wideTrace;
+            std::fprintf(stderr,
+                         "[hires-wide] prim %u box %d,%d-%d,%d frame fbp %u fbw %u psm %u fbmsk %08x test %05x alpha %llx tme %u tbp %u tbw %u tpsm %u "
+                         "v0 %.1f,%.1f v1 %.1f,%.1f v2 %.1f,%.1f scissor %u,%u-%u,%u present %llu\n",
+                         static_cast<unsigned>(st.prim.type), box[0], box[1], box[2], box[3], c.frame.fbp, c.frame.fbw, c.frame.psm,
+                         static_cast<unsigned>(c.frame.fbmsk), static_cast<unsigned>(c.test), static_cast<unsigned long long>(c.alpha),
+                         st.prim.tme ? 1u : 0u, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, batch.vertices[0].x, batch.vertices[0].y,
+                         batch.vertices[1].x, batch.vertices[1].y, batch.vertexCount > 2 ? batch.vertices[2].x : 0.0f,
+                         batch.vertexCount > 2 ? batch.vertices[2].y : 0.0f, c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1,
+                         static_cast<unsigned long long>(m_presentCount));
+        }
         if (hiFlush && !m_prims.empty())
         {
             NoteFlush("hires-order");
@@ -3963,7 +4001,10 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
         // PS2X_GS_HIRES_TRACE=<n>: the first n primitives with a shadow role or a stale write.
         static long s_hiTrace = []() { const char *v = std::getenv("PS2X_GS_HIRES_TRACE"); return v ? std::strtol(v, nullptr, 0) : 0L; }();
         static const long s_hiTraceFrom = []() { const char *v = std::getenv("PS2X_GS_HIRES_TRACE_FROM"); return v ? std::strtol(v, nullptr, 0) : 0L; }();
-        if (s_hiTrace > 0 && m_presentCount >= static_cast<uint64_t>(s_hiTraceFrom) && (hiFrameMask | hiZMask | hiStaleFrame | hiStaleZ) != 0u)
+        // PS2X_GS_HIRES_TRACE_STALE=1: only the primitives with a stale write.
+        static const bool s_hiTraceStale = std::getenv("PS2X_GS_HIRES_TRACE_STALE") != nullptr;
+        if (s_hiTrace > 0 && m_presentCount >= static_cast<uint64_t>(s_hiTraceFrom) &&
+            (s_hiTraceStale ? (hiStaleFrame | hiStaleZ) : (hiFrameMask | hiZMask | hiStaleFrame | hiStaleZ)) != 0u)
         {
             --s_hiTrace;
             std::fprintf(stderr,
@@ -4037,7 +4078,7 @@ void GSExactRenderer::Draw(const GSPrimitiveBatch &batch)
     p[27] = hiFrameMask;
     p[28] = hiZMask;
     p[29] = hiZOnly ? 1u : 0u;
-    p[30] = hiSqueeze ? 1u : 0u;
+    p[30] = (hiSqueeze ? 1u : 0u) | (hiSnap ? 2u : 0u);
     if (m_hiOn)
         for (int i = 0; i < kHiTargets; ++i)
         {

@@ -1492,11 +1492,25 @@ void main()
                 glBindFramebuffer(GL_FRAMEBUFFER, HI.fbo);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, HI.curTex, 0);
                 drawPasses(hw, hh, HI.polyFbo, HI.polyTex, HI.fbo);
-                // The work buffer gets the key colour, not the picture (see the layer's comment).
+                // GS memory gets the picture scaled down to 1x, so a resync of the high-resolution image from GS memory
+                // (the pause menu's writes make FBP 224 stale every frame) shows the scene, not a flat colour.
+                // PS2X_MOON_HIRES_KEY=1: the old flat key colour.
+                static const bool s_key = envOn("PS2X_MOON_HIRES_KEY");
                 glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
                 glViewport(0, 0, W, H);
-                glClearColor(kKeyR / 255.0f, kKeyG / 255.0f, kKeyB / 255.0f, 64.0f / 255.0f);
-                glClear(GL_COLOR_BUFFER_BIT);
+                if (s_key)
+                {
+                    glClearColor(kKeyR / 255.0f, kKeyG / 255.0f, kKeyB / 255.0f, 64.0f / 255.0f);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                }
+                else
+                {
+                    glDisable(GL_SCISSOR_TEST);
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, HI.fbo);
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, G.fbo);
+                    glBlitFramebuffer(0, 0, hw, hh, 0, 0, W, H, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                    glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
+                }
                 glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
                 HI.curDrawn = true;
             }
@@ -1829,7 +1843,13 @@ void main()
             }
         }
         g_frameOriginal(rdram, ctx, runtime);
-        g_chainFrame.reset(); // not consumed: the original took another branch
+        // The original can yield to the EE scheduler at its JAL to FUN_002092d8 (dispatchGuestBranch returns false with
+        // ctx->pc = 0x2092D8; every frame while the pause menu is up). The scheduler resumes the thread there, which runs
+        // chainHook, so the frame is kept for it; one never taken is cleared at the next frameHook entry.
+        // PS2X_MOON_DROP_YIELDED_FRAME=1: the old behaviour (the frame is dropped, the paused screen is black).
+        static const bool s_dropYielded = envOn("PS2X_MOON_DROP_YIELDED_FRAME");
+        if (s_dropYielded || ctx->pc != 0x002092D8u)
+            g_chainFrame.reset(); // not consumed: the original took another branch
         g_restoreGeo.clear();
     }
 

@@ -13,6 +13,7 @@
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
 #include "rlImGui.h"
+#include "ps2_controls_panel.h"
 #include "raylib.h"
 #endif
 
@@ -2211,12 +2212,25 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         toggleVisible();
     }
 
-    if (!m_visible)
+    // The controls window (F2) is independent of the debugger, so begin an ImGui frame if either is shown.
+    const bool showControls = ps2controls::update();
+    if (!m_visible && !showControls)
     {
         return;
     }
 
     rlImGuiBegin();
+
+    if (showControls)
+    {
+        ps2controls::draw();
+    }
+
+    if (!m_visible)
+    {
+        rlImGuiEnd();
+        return;
+    }
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))

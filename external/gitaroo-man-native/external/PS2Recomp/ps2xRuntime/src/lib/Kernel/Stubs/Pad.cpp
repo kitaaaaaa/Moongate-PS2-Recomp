@@ -201,7 +201,8 @@ namespace ps2_stubs
         }
 
         // PS2X_INPUT_SCRIPT="start@600:10,cross@900" presses a button at a guest vsync tick for N frames
-        // (default 6). lleft/lright/lup/ldown push the left stick fully. Used for unattended testing; port 0 only.
+        // (default 6). lleft/lright/lup/ldown push the left stick fully. Used for unattended testing. Items start
+        // with "p2." to press on port 1 ("p2.circle@10:5"); port 1 then reads as connected from then on.
         // PS2X_INPUT_LIVE=<file> also reads lines appended to <file> while the game runs, in the same
         // syntax with ticks counted from when the line is read ("cross", "down@20:4,cross@40"); a dev tool
         // for driving menus from another process.
@@ -212,7 +213,11 @@ namespace ps2_stubs
             int8_t stickY = 0;
             uint64_t tick = 0;
             uint64_t frames = 6;
+            int port = 0;
         };
+
+        // Set once any scripted or live press targets port 1, so tests can play player 2 without hardware.
+        std::atomic<bool> g_scriptedPort1{false};
 
         void parsePresses(const std::string &text, uint64_t base, std::vector<ScriptedPress> &result)
         {
@@ -232,10 +237,15 @@ namespace ps2_stubs
                 start = end + 1;
                 item.erase(0, item.find_first_not_of(" \t\r\n"));
                 item.erase(item.find_last_not_of(" \t\r\n") + 1);
+                ScriptedPress press;
+                if (item.rfind("p2.", 0) == 0)
+                {
+                    press.port = 1;
+                    item.erase(0, 3);
+                }
                 const size_t at = item.find('@');
                 const size_t colon = item.find(':');
                 const size_t nameEnd = std::min(at, colon);
-                ScriptedPress press;
                 const std::string name = item.substr(0, nameEnd);
                 for (const auto &[label, mask] : kNames)
                 {
@@ -254,7 +264,11 @@ namespace ps2_stubs
                 if (colon != std::string::npos)
                     press.frames = std::strtoull(item.c_str() + colon + 1, nullptr, 10);
                 if (press.mask != 0 || press.stickX != 0 || press.stickY != 0)
+                {
+                    if (press.port == 1)
+                        g_scriptedPort1.store(true, std::memory_order_relaxed);
                     result.push_back(press);
+                }
             }
         }
 
@@ -270,10 +284,17 @@ namespace ps2_stubs
             return presses;
         }
 
-        // Presses read from PS2X_INPUT_LIVE so far, with absolute ticks; expired ones are dropped.
-        std::vector<ScriptedPress> &livePresses(uint64_t tick)
+        // Presses read from PS2X_INPUT_LIVE so far, with absolute ticks on the port-0 input clock.
+        std::vector<ScriptedPress> &liveList()
         {
             static std::vector<ScriptedPress> presses;
+            return presses;
+        }
+
+        // Reads new PS2X_INPUT_LIVE lines and drops expired presses; called only with the port-0 tick.
+        std::vector<ScriptedPress> &livePresses(uint64_t tick)
+        {
+            std::vector<ScriptedPress> &presses = liveList();
             static const char *s_path = std::getenv("PS2X_INPUT_LIVE");
             static std::streamoff s_offset = 0;
             static uint64_t s_lastCheck = ~0ull;
@@ -309,7 +330,7 @@ namespace ps2_stubs
 
         void applyScriptedState(PadInputState &state, PS2Runtime *runtime, int port)
         {
-            if (port != 0 || runtime == nullptr)
+            if ((port != 0 && port != 1) || runtime == nullptr)
             {
                 return;
             }
@@ -321,16 +342,26 @@ namespace ps2_stubs
                 const char *clock = std::getenv("PS2X_INPUT_CLOCK");
                 return clock && std::string(clock) == "reads";
             }();
+            // One input clock for both ports: port 0's reads (or the vblank tick). Port 1 uses the tick of
+            // port 0's latest read, so presses on both ports and the live list share one timeline.
             static uint64_t s_reads = 0;
-            const uint64_t tick = s_readClock ? s_reads++ : runtime->eeScheduler().currentVSyncTick();
+            uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+            if (s_readClock)
+                tick = port == 0 ? s_reads++ : (s_reads > 0 ? s_reads - 1 : 0);
             static const bool s_traceClock = std::getenv("PS2X_TRACE_PAD") != nullptr;
-            if (s_traceClock && (tick % 600u) == 0u)
+            if (s_traceClock && port == 0 && (tick % 600u) == 0u)
                 std::cout << "[pad] input clock " << tick << " at vblank " << runtime->eeScheduler().currentVSyncTick()
                           << std::endl;
             for (const ScriptedPress &press : scriptedPresses())
-                applyPress(state, press, tick);
-            for (const ScriptedPress &press : livePresses(tick))
-                applyPress(state, press, tick);
+            {
+                if (press.port == port)
+                    applyPress(state, press, tick);
+            }
+            for (const ScriptedPress &press : port == 0 ? livePresses(tick) : liveList())
+            {
+                if (press.port == port)
+                    applyPress(state, press, tick);
+            }
         }
 
         // PS2X_INPUT_RECORD=<file> writes the pad state the game reads, per port, as text lines
@@ -345,6 +376,39 @@ namespace ps2_stubs
             uint8_t lx = kPadAnalogCenter, ly = kPadAnalogCenter, rx = kPadAnalogCenter, ry = kPadAnalogCenter;
         };
 
+        // Set when the PS2X_INPUT_PLAYBACK recording has port 1 entries, so port 1 reads as connected.
+        std::atomic<bool> g_playbackPort1{false};
+
+        struct Playback
+        {
+            bool play = false;
+            std::vector<RecordedState> states[kPadPortCount];
+        };
+
+        // The PS2X_INPUT_PLAYBACK recording, loaded on first use.
+        Playback &playback()
+        {
+            static Playback s_playback = []() {
+                Playback result;
+                const char *path = std::getenv("PS2X_INPUT_PLAYBACK");
+                FILE *f = (path && *path) ? std::fopen(path, "r") : nullptr;
+                if (!f)
+                    return result;
+                result.play = true;
+                unsigned p, b, lx, ly, rx, ry;
+                unsigned long long r, vb;
+                while (std::fscanf(f, "%u %llx %x %x %x %x %x %llx", &p, &r, &b, &lx, &ly, &rx, &ry, &vb) == 8)
+                    if (p < kPadPortCount)
+                        result.states[p].push_back({r, static_cast<uint16_t>(b), static_cast<uint8_t>(lx), static_cast<uint8_t>(ly),
+                                                    static_cast<uint8_t>(rx), static_cast<uint8_t>(ry)});
+                std::fclose(f);
+                if (kPadPortCount > 1 && !result.states[1].empty())
+                    g_playbackPort1.store(true, std::memory_order_relaxed);
+                return result;
+            }();
+            return s_playback;
+        }
+
         void recordOrPlayBack(PadInputState &state, PS2Runtime *runtime, int port)
         {
             if (port < 0 || port >= static_cast<int>(kPadPortCount))
@@ -355,29 +419,15 @@ namespace ps2_stubs
                 const char *path = std::getenv("PS2X_INPUT_RECORD");
                 return (path && *path) ? std::fopen(path, "w") : nullptr;
             }();
-            static std::vector<RecordedState> s_playback[kPadPortCount];
             static size_t s_next[kPadPortCount] = {};
-            static const bool s_play = []() {
-                const char *path = std::getenv("PS2X_INPUT_PLAYBACK");
-                FILE *f = (path && *path) ? std::fopen(path, "r") : nullptr;
-                if (!f)
-                    return false;
-                unsigned p, b, lx, ly, rx, ry;
-                unsigned long long r, vb;
-                while (std::fscanf(f, "%u %llx %x %x %x %x %x %llx", &p, &r, &b, &lx, &ly, &rx, &ry, &vb) == 8)
-                    if (p < kPadPortCount)
-                        s_playback[p].push_back({r, static_cast<uint16_t>(b), static_cast<uint8_t>(lx), static_cast<uint8_t>(ly),
-                                                 static_cast<uint8_t>(rx), static_cast<uint8_t>(ry)});
-                std::fclose(f);
-                return true;
-            }();
+            const bool s_play = playback().play;
             if (!s_record && !s_play)
                 return;
             std::lock_guard<std::mutex> lock(s_mutex);
             const uint64_t read = s_reads[port]++;
             if (s_play)
             {
-                const std::vector<RecordedState> &v = s_playback[port];
+                const std::vector<RecordedState> &v = playback().states[port];
                 size_t &i = s_next[port];
                 while (i + 1 < v.size() && v[i + 1].read <= read)
                     ++i;
@@ -519,7 +569,7 @@ namespace ps2_stubs
                     state.ly = backendData[7];
                     usedBackend = true;
                 }
-                else
+                else if (port == 0)
                 {
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
@@ -674,17 +724,38 @@ namespace ps2_stubs
         setReturnS32(ctx, 1);
     }
 
+    namespace
+    {
+        // Port 1 has a pad when a host device is bound to it, a script plays it, or PS2X_PAD2=1.
+        bool padPortConnected(int port, PS2Runtime *runtime)
+        {
+            if (port == 0)
+                return true;
+            if (port != 1)
+                return false;
+            static const bool s_forced = []()
+            {
+                const char *env = std::getenv("PS2X_PAD2");
+                return env && std::string(env) == "1";
+            }();
+            (void)scriptedPresses(); // parses PS2X_INPUT_SCRIPT, which may target port 1
+            (void)playback();        // loads PS2X_INPUT_PLAYBACK, which may have port 1 entries
+            return s_forced || g_scriptedPort1.load(std::memory_order_relaxed) ||
+                   g_playbackPort1.load(std::memory_order_relaxed) ||
+                   (runtime && runtime->padBackend().portConnected(1));
+        }
+    }
+
     void scePadGetState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
         std::lock_guard<std::mutex> lock(g_padStateMutex);
         PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
                                                            static_cast<int>(getRegU32(ctx, 5)));
         int32_t state = kPadStateDisconnected;
-        // Only port 0 has a controller. An empty port opens fine but reports disconnected, as on the console;
-        // games that see a pad here start in two-player mode.
-        if (portState && portState->open && getRegU32(ctx, 4) == 0u)
+        // An empty port opens fine but reports disconnected, as on the console; games that see a pad on
+        // port 1 start in two-player mode.
+        if (portState && portState->open && padPortConnected(static_cast<int>(getRegU32(ctx, 4)), runtime))
         {
             if (portState->transientState != 0u)
             {
@@ -867,7 +938,7 @@ namespace ps2_stubs
         }
 
         ps2TraceGuestRangeWrite(rdram, dataAddr, 32u, "scePadRead", ctx);
-        if (port != 0 || !readPadPortData(port, slot, runtime, data, dataAddr))
+        if (!padPortConnected(port, runtime) || !readPadPortData(port, slot, runtime, data, dataAddr))
         {
             setReturnS32(ctx, 0);
             return;

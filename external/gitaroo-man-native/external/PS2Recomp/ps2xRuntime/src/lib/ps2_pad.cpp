@@ -1,7 +1,6 @@
 #include "runtime/ps2_pad.h"
+#include "runtime/ps2_input.h"
 #include "ps2_host_backend.h"
-#include <algorithm>
-#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -22,46 +21,6 @@ extern "C"
 namespace
 {
     constexpr uint8_t kPadAnalogMarker = 0x73;
-    constexpr uint8_t kPadStickCenter = 0x80;
-    // Radial stick deadzone; the remaining travel is rescaled to the full range.
-    constexpr float kStickDeadzone = 0.15f;
-    constexpr int kMaxGamepads = 4;
-
-    constexpr uint16_t PAD_LEFT = 0x0080u;
-    constexpr uint16_t PAD_DOWN = 0x0040u;
-    constexpr uint16_t PAD_RIGHT = 0x0020u;
-    constexpr uint16_t PAD_UP = 0x0010u;
-    constexpr uint16_t PAD_START = 0x0008u;
-    constexpr uint16_t PAD_R3 = 0x0004u;
-    constexpr uint16_t PAD_L3 = 0x0002u;
-    constexpr uint16_t PAD_SELECT = 0x0001u;
-    constexpr uint16_t PAD_SQUARE = 0x8000u;
-    constexpr uint16_t PAD_CROSS = 0x4000u;
-    constexpr uint16_t PAD_CIRCLE = 0x2000u;
-    constexpr uint16_t PAD_TRIANGLE = 0x1000u;
-    constexpr uint16_t PAD_R1 = 0x0800u;
-    constexpr uint16_t PAD_L1 = 0x0400u;
-    constexpr uint16_t PAD_R2 = 0x0200u;
-    constexpr uint16_t PAD_L2 = 0x0100u;
-
-    uint8_t axisToByte(float axis)
-    {
-        axis = std::clamp(axis, -1.0f, 1.0f);
-        return static_cast<uint8_t>(std::lround((axis + 1.0f) * 127.5f));
-    }
-
-    void applyDeadzone(float &x, float &y)
-    {
-        const float magnitude = std::sqrt(x * x + y * y);
-        if (magnitude <= kStickDeadzone)
-        {
-            x = y = 0.0f;
-            return;
-        }
-        const float scale = std::min(1.0f, (magnitude - kStickDeadzone) / (1.0f - kStickDeadzone)) / magnitude;
-        x *= scale;
-        y *= scale;
-    }
 
 #if !defined(PLATFORM_VITA)
     // GLFW's built-in database only lists some firmware versions of the Xbox Series controller over
@@ -94,17 +53,14 @@ namespace
 
 void PSPadBackend::updateGamepads()
 {
-#if defined(PLATFORM_VITA)
-    m_activeGamepad.store(IsGamepadAvailable(0) ? 0 : -1, std::memory_order_relaxed);
-#else
+#if !defined(PLATFORM_VITA)
     if (!m_userMappingsLoaded)
     {
         m_userMappingsLoaded = true;
         loadUserMappings();
     }
 
-    int active = -1;
-    for (int jid = 0; jid < kMaxGamepads; ++jid)
+    for (int jid = 0; jid < kMaxJoysticks; ++jid)
     {
         if (!glfwJoystickPresent(jid))
         {
@@ -129,15 +85,12 @@ void PSPadBackend::updateGamepads()
                           << ") has no gamepad mapping; add one via SDL_GAMECONTROLLERCONFIG or PS2X_GAMECONTROLLERDB"
                           << std::endl;
         }
-
-        if (active < 0 && glfwJoystickIsGamepad(jid))
-            active = jid;
     }
-    m_activeGamepad.store(active, std::memory_order_relaxed);
 #endif
+    ps2input::Input::get().refreshDevices();
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
         return false;
@@ -146,77 +99,19 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[0] = 0x01;
     data[1] = kPadAnalogMarker;
 
-    uint16_t btns = 0xFFFFu;
-    auto press = [&btns](uint16_t mask, bool down)
-    {
-        if (down)
-            btns &= ~mask;
-    };
-    float lx = 0.0f, ly = 0.0f, rx = 0.0f, ry = 0.0f;
+    uint16_t buttons = 0xFFFFu;
+    uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
+    const bool connected = ps2input::Input::get().readPort(port, buttons, lx, ly, rx, ry);
+    data[2] = static_cast<uint8_t>(buttons & 0xFF);
+    data[3] = static_cast<uint8_t>(buttons >> 8);
+    data[4] = rx;
+    data[5] = ry;
+    data[6] = lx;
+    data[7] = ly;
+    return connected;
+}
 
-    // Controller and keyboard are merged, so either can be used at any time.
-    const int gamepad = m_activeGamepad.load(std::memory_order_relaxed);
-    if (gamepad >= 0 && IsGamepadAvailable(gamepad))
-    {
-        press(PAD_UP, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP));
-        press(PAD_DOWN, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN));
-        press(PAD_LEFT, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT));
-        press(PAD_RIGHT, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT));
-        press(PAD_CROSS, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN));
-        press(PAD_CIRCLE, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT));
-        press(PAD_SQUARE, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT));
-        press(PAD_TRIANGLE, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP));
-        press(PAD_L1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1));
-        press(PAD_R1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1));
-        press(PAD_L2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2));
-        press(PAD_R2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2));
-        press(PAD_START, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT));
-        press(PAD_SELECT, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT));
-        press(PAD_L3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_THUMB));
-        press(PAD_R3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB));
-
-        lx = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X);
-        ly = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y);
-        rx = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X);
-        ry = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y);
-        applyDeadzone(lx, ly);
-        applyDeadzone(rx, ry);
-    }
-
-    // Keyboard: arrows = d-pad, WASD = left stick, IJKL = right stick.
-    press(PAD_UP, IsKeyDown(KEY_UP));
-    press(PAD_DOWN, IsKeyDown(KEY_DOWN));
-    press(PAD_LEFT, IsKeyDown(KEY_LEFT));
-    press(PAD_RIGHT, IsKeyDown(KEY_RIGHT));
-    press(PAD_CROSS, IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE));
-    press(PAD_CIRCLE, IsKeyDown(KEY_C));
-    press(PAD_SQUARE, IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0));
-    press(PAD_TRIANGLE, IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1));
-    press(PAD_L1, IsKeyDown(KEY_Q));
-    press(PAD_R1, IsKeyDown(KEY_E));
-    press(PAD_L2, IsKeyDown(KEY_LEFT_SHIFT));
-    press(PAD_R2, IsKeyDown(KEY_RIGHT_SHIFT));
-    press(PAD_START, IsKeyDown(KEY_ENTER));
-    press(PAD_SELECT, IsKeyDown(KEY_TAB));
-
-    auto keyStick = [](float &x, float &y, KeyboardKey left, KeyboardKey right, KeyboardKey up, KeyboardKey down)
-    {
-        const float kx = (IsKeyDown(right) ? 1.0f : 0.0f) - (IsKeyDown(left) ? 1.0f : 0.0f);
-        const float ky = (IsKeyDown(down) ? 1.0f : 0.0f) - (IsKeyDown(up) ? 1.0f : 0.0f);
-        if (kx == 0.0f && ky == 0.0f)
-            return;
-        const float length = std::sqrt(kx * kx + ky * ky);
-        x = kx / length;
-        y = ky / length;
-    };
-    keyStick(lx, ly, KEY_A, KEY_D, KEY_W, KEY_S);
-    keyStick(rx, ry, KEY_J, KEY_L, KEY_I, KEY_K);
-
-    data[2] = static_cast<uint8_t>(btns & 0xFF);
-    data[3] = static_cast<uint8_t>(btns >> 8);
-    data[4] = axisToByte(rx);
-    data[5] = axisToByte(ry);
-    data[6] = axisToByte(lx);
-    data[7] = axisToByte(ly);
-    return true;
+bool PSPadBackend::portConnected(int port) const
+{
+    return ps2input::Input::get().portConnected(port);
 }

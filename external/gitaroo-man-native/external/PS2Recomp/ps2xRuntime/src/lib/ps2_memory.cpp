@@ -2954,8 +2954,9 @@ void PS2Memory::markModified(uint32_t address, uint32_t size)
             size_t bitIndex = (addr - region.start) / 4;
             if (bitIndex < region.modified.size())
             {
+                // No log here: games DMA data into the executable segment every frame (Virtual-On's split screen
+                // copies from the scratchpad into 0x2C7500 and 0x513100), and one line per word stalled the game.
                 region.modified[bitIndex] = true;
-                RUNTIME_LOG("Marked code at " << std::hex << addr << std::dec << " as modified");
             }
         }
     }
